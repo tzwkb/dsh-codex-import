@@ -64,6 +64,11 @@ CLI **无法导入图片**：它没有附件库，而附件库会先重新编码
 | 消息、工具调用与结果 | 导入。工具输出默认截断到 4000 字符（`--max-tool-output`，`0` 表示不截断），因为它占原始体积约 95%。 |
 | 思维链 | 只有明文 `summary`，覆盖率约三分之一。其余是 OpenAI 服务端密钥的 Fernet 令牌，任何客户端都读不了。 |
 | 图片 | 由 `/import-codex` 经附件库导入；CLI 会跳过并明确报告。 |
+
+导入的图片只有在**当前模型支持图片**时才真正可见。模型目录条目若未声明 `inputModalities`，会默认为纯文本，harness 会在请求发出前把图片替换成
+`[image omitted because this model accepts text only; attachment sha256:…]` —— 导入本身仍然正确，但 agent 会说自己看不到图片。
+`deepseek-flash` 与 `deepseek-v4-flash-vision-exp` 声明了 `["text","image"]`；`deepseek-v4-flash` 和 `deepseek-v4-pro` 没有。
+另注意 `acp` profile 写死使用 `deepseek-v4-flash`，所以**通过 ACP 验证图片会得到假阴性**。
 | Codex 注入的上下文 | 丢弃。但 `# Files mentioned by the user:` 是**拆壳**而非丢弃 —— 它内部裹着真人的原始提问。 |
 | 压缩标记、world state、token 计数、子 agent 信封 | 丢弃：属于上下文管道，不是对话内容。 |
 | Codex 工具名（`exec`、`shell` 等） | 原样保留为历史供模型阅读，但在 DSH 里不可调用。 |

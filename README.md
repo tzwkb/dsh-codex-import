@@ -68,6 +68,16 @@ The CLI cannot import images: it has no attachment store, and the store re-encod
 | Compaction markers, world state, token counts, inter-agent envelopes | Dropped: context plumbing rather than conversation. |
 | Codex tool names (`exec`, `shell`, …) | Preserved verbatim as history the model can read; they are not callable in DSH. |
 
+An imported image is only *visible* again if the active model accepts images. A
+catalog entry without `inputModalities` defaults to text-only, and the harness
+then substitutes `[image omitted because this model accepts text only;
+attachment sha256:…]` before the request leaves the process — the import is
+still correct, but the agent will say it cannot see images.
+`deepseek-flash` and `deepseek-v4-flash-vision-exp` declare `["text","image"]`;
+`deepseek-v4-flash` and `deepseek-v4-pro` do not. The `acp` profile is pinned to
+`deepseek-v4-flash`, so verifying image playback through ACP yields a false
+negative.
+
 ## Why the format is fussy
 
 DSH validates a session log three times, and the weaker checks are not enough — an import can list, resume, and still fail the next turn. Five rules were each found by running a real check, and each is enforced by `lib/verify.js`:
