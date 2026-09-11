@@ -41,6 +41,7 @@ Inside a `dsh-tui` session:
 /import-codex                      # conversations started in the last 24 hours
 /import-codex --since-hours 168    # last week
 /import-codex --session <id>       # one Codex session id (repeatable)
+/import-codex --max-tool-output 4000  # smaller sessions, at the cost of detail
 /import-codex --dry-run            # convert and verify, write nothing
 /import-codex --help
 ```
@@ -61,7 +62,7 @@ The CLI cannot import images: it has no attachment store, and the store re-encod
 
 | | Result |
 | --- | --- |
-| Messages, tool calls and results | Imported. Tool output is truncated to 4000 chars by default (`--max-tool-output`, `0` keeps all) because it is ~95% of raw volume. |
+| Messages, tool calls and results | Imported in full. `--max-tool-output N` truncates each tool output to N chars if you need smaller sessions; the default is 0, which keeps everything. |
 | Reasoning | Only the plaintext `summary`, for roughly a third of records. The rest is a Fernet token keyed by OpenAI and cannot be read by any client. |
 | Images | Imported by `/import-codex` through the attachment store. Skipped, and reported, by the CLI. |
 | Codex-injected context | Dropped. The `# Files mentioned by the user:` envelope is unwrapped rather than dropped, because it wraps the human's actual prompt. |

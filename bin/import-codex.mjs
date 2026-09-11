@@ -13,7 +13,7 @@ import { runImport, listConversations } from '../lib/convert.js'
 import { verifyPaths } from '../lib/verify.js'
 
 function parse(argv) {
-  const opts = { out: undefined, sinceHours: 24, sessionIds: [], maxToolOutput: 4000, dryRun: false, paths: [] }
+  const opts = { out: undefined, sinceHours: 24, sessionIds: [], maxToolOutput: 0, dryRun: false, paths: [] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--out') opts.out = argv[++i]

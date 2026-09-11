@@ -41,6 +41,7 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 /import-codex                      # 最近 24 小时开始的对话
 /import-codex --since-hours 168    # 最近一周
 /import-codex --session <id>       # 指定某个 Codex session id（可重复）
+/import-codex --max-tool-output 4000  # 换取更小的会话（代价是细节减少）
 /import-codex --dry-run            # 只转换并校验，不写入
 /import-codex --help
 ```
@@ -61,7 +62,7 @@ CLI **无法导入图片**：它没有附件库，而附件库会先重新编码
 
 | | 结果 |
 | --- | --- |
-| 消息、工具调用与结果 | 导入。工具输出默认截断到 4000 字符（`--max-tool-output`，`0` 表示不截断），因为它占原始体积约 95%。 |
+| 消息、工具调用与结果 | **完整导入**。若需要更小的会话，可用 `--max-tool-output N` 把每条工具输出截断到 N 字符；默认 0，即全部保留。 |
 | 思维链 | 只有明文 `summary`，覆盖率约三分之一。其余是 OpenAI 服务端密钥的 Fernet 令牌，任何客户端都读不了。 |
 | 图片 | 由 `/import-codex` 经附件库导入；CLI 会跳过并明确报告。 |
 

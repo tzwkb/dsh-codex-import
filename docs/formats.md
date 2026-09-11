@@ -195,9 +195,18 @@ additional plaintext exists.
 
 ## Defaults and their cost
 
-- Tool output is truncated to 4000 chars (`--max-tool-output`, `0` keeps all).
-  Tool output is ~95% of raw volume; uncapped, a single conversation can exceed
-  any usable context.
+- Tool output is kept in full by default. It is ~95% of raw volume, so a day of
+  conversations can run to several megabytes; `--max-tool-output N` truncates
+  each output to N chars when smaller sessions matter more than completeness.
+  A truncated output ends with an explicit `[... truncated X of Y chars ...]`
+  marker, so the loss is never silent.
+- A `compacted` record's `replacement_history` is a recovery source, not
+  context plumbing. Most of it repeats messages the log still holds, but some
+  exists nowhere else; dropping the record whole loses real turns. Messages are
+  matched per conversation by id (falling back to role + body) so the repeats
+  are skipped, and the remainder is emitted at the compaction's own position.
+  Compaction histories carry only text and images — never tool calls — so
+  inserting them cannot orphan a tool result.
 - Imported sessions record `workspace-write` / `ask` rather than Codex's
   original sandbox: the records are informational and the resuming harness
   applies its own policy.
