@@ -1,0 +1,12 @@
+# Dependencies (the plugin has none, but a local install may create these)
+node_modules/
+
+# Local scratch output from bin/import-codex.mjs
+/tmp-import/
+codex-import-manifest.txt
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

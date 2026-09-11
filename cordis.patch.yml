@@ -1,0 +1,3 @@
+- insert:
+    - id: codex-import
+      name: 'dsh-codex-import'
