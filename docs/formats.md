@@ -47,6 +47,23 @@ Physical layout — plain concatenated zstd frames:
 - **Frame 1**: the `session` header record as one JSON line plus `\n`, nothing else.
 - **Frame 2+**: event lines, each `\n`-terminated.
 
+### The frame count is a continuation signal
+
+This importer writes a session as exactly **two** frames: the header, then the
+whole event stream in one batch. The running harness does not — it appends one
+frame per event batch, so a session it has continued has three frames, then
+four, and so on (an eight-turn session was observed at 200 frames).
+
+That difference is what makes a refresh safe. A log at two frames has not been
+continued, so replacing its file cannot delete a turn; a log with more frames
+has been, and is left alone. Pairing the frame count with a digest of the body
+covers the remaining case — a log the harness rewrote wholesale, which can fold
+back down to two frames while carrying turns this importer never wrote.
+
+Frame boundaries are found by scanning for the zstd magic and confirming that
+decompressing both the prefix and the remainder succeeds, so a magic-shaped byte
+sequence inside compressed data is not mistaken for a boundary.
+
 ## DSH event mapping
 
 | Event | Notes |

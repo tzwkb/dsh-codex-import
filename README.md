@@ -38,15 +38,16 @@ Inside a `dsh-tui` session:
 
 ```
 /import-codex --list               # see what is available before importing
-/import-codex                      # conversations started in the last 24 hours
+/import-codex                      # lists too — nothing is written without a scope
 /import-codex --since-hours 168    # last week
 /import-codex --session <id>       # one Codex session id (repeatable)
 /import-codex --max-tool-output 4000  # smaller sessions, at the cost of detail
 /import-codex --dry-run            # convert and verify, write nothing
+/import-codex --force              # refresh even a session you continued in DSH
 /import-codex --help
 ```
 
-Start with `--list`. It prints each conversation with its full session id, time span, working directory, and opening prompt, so the scope can be chosen before anything is written. The window is selected by the timestamp **in the filename**, never by mtime — Codex rewrites old rollouts, so a months-old file can carry today's mtime.
+A bare invocation lists rather than importing everything in range, because the scope should be chosen deliberately. The list prints each conversation with its full session id, time span, working directory, and opening prompt. The window is selected by the timestamp **in the filename**, never by mtime — Codex rewrites old rollouts, so a months-old file can carry today's mtime.
 
 The same work is available from a shell, without a running harness:
 
@@ -54,9 +55,25 @@ The same work is available from a shell, without a running harness:
 node bin/import-codex.mjs list    --since-hours 168
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check
 node bin/import-codex.mjs verify  /tmp/import-check
+node bin/import-codex.mjs sync    --since-hours 24      # into $DSH_HOME/sessions
 ```
 
-The CLI cannot import images: it has no attachment store, and the store re-encodes an image before hashing it, so a durable reference cannot be fabricated. It reports how many images it skipped instead of dropping them silently.
+`convert` writes a directory and stops there, so the result can be inspected first. `sync` is the same pipeline aimed at a live sessions root: convert to a scratch directory, verify, then reconcile session by session. Both open the attachment store directly, so the CLI imports images just as `/import-codex` does.
+
+## Re-running is incremental
+
+Importing the same conversation again is safe, and cheap when nothing changed. Each session is compared against a fresh conversion by the digest of its event stream, which sorts every session into one of four outcomes:
+
+| | What happens |
+| --- | --- |
+| Not imported yet | Installed. |
+| Byte-identical content | **Nothing is written at all.** A re-run that changes nothing touches no file. |
+| Content differs | **Refreshed in place** — same session id and directory, so `/resume` entries and workspace state stay valid. This is how a conversation that grew in Codex, or one imported before a converter change, is brought up to date. |
+| Not the file this importer wrote | **Left alone.** |
+
+The last case matters most. DSH appends one zstd frame per event batch, so a session you have continued inside DSH is no longer a two-frame log; rewriting it would delete your turns. A log at two frames whose digest does not match what the importer recorded is one something else rewrote, and is treated the same way. `--force` overrides this, and is destructive by design. A conversion that could not reach the attachment store is also refused rather than allowed to overwrite a log that holds images.
+
+Nothing is ever deleted, and no session is ever imported twice: a refresh replaces the file, keeping the directory, any sibling files, and the session id.
 
 ## What survives, and what does not
 
@@ -64,9 +81,9 @@ The CLI cannot import images: it has no attachment store, and the store re-encod
 | --- | --- |
 | Messages, tool calls and results | Imported in full. `--max-tool-output N` truncates each tool output to N chars if you need smaller sessions; the default is 0, which keeps everything. |
 | Reasoning | Only the plaintext `summary`, for roughly a third of records. The rest is a Fernet token keyed by OpenAI and cannot be read by any client. |
-| Images | Imported by `/import-codex` through the attachment store. Skipped, and reported, by the CLI. |
+| Images | Imported, through the attachment store. Reported, never dropped silently. |
 | Codex-injected context | Dropped. The `# Files mentioned by the user:` envelope is unwrapped rather than dropped, because it wraps the human's actual prompt. |
-| Compaction markers, world state, token counts, inter-agent envelopes | Dropped: context plumbing rather than conversation. |
+| Compaction markers, world state, token counts, inter-agent envelopes | Dropped: context plumbing rather than conversation. Messages that survive *only* inside a compaction's `replacement_history` are recovered. |
 | Codex tool names (`exec`, `shell`, …) | Preserved verbatim as history the model can read; they are not callable in DSH. |
 
 An imported image is only *visible* again if the active model accepts images. A
@@ -106,6 +123,15 @@ scripts/reinstall.sh          # re-copies into the dsh-tui profile, then restart
 ```
 
 `scripts/reinstall.sh <profile>` targets another profile. Re-running `dsh plugin add` refreshes an existing `file:` dependency in place; removing first is not required.
+
+Tests run against a real Codex corpus and a throwaway `DSH_HOME`, so they need no mocks and leave nothing behind:
+
+```sh
+npm test              # reconcile behaviour, then the composed /import-codex command
+node scripts/test-sync.mjs --keep     # leave the scratch tree for inspection
+```
+
+`test-sync.mjs` covers determinism, install, no-op re-sync, in-place refresh, both refusal cases, `--force`, and the image guard. `test-plugin.mjs` composes the plugin the way the harness does and invokes the handler, because the slash command is the surface that actually gets used and no other test reaches it.
 
 Before changing `lib/convert.js` or `lib/verify.js`, read [`docs/formats.md`](docs/formats.md). `DSH_CODEX_IMPORT_SELFTEST=<path>` makes the plugin record its command registration to a file, which is the only headless way to confirm the command registered — `dsh-acp` does not parse slash commands, and the `acp` profile does not load another profile's bundles.
 
