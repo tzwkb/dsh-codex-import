@@ -76,10 +76,14 @@ if (command === 'list') {
     injected: a.injected + r.stats.injected,
     truncated: a.truncated + r.stats.truncated,
     images: a.images + r.stats.imagesSkipped + r.stats.imagesImported,
-  }), { records: 0, reasoning: 0, tools: 0, injected: 0, truncated: 0, images: 0 })
+    history: a.history + r.stats.historyMessages,
+  }), { records: 0, reasoning: 0, tools: 0, injected: 0, truncated: 0, images: 0, history: 0 })
   console.log(
     `\n${results.length} sessions, ${totals.records} records, ${totals.reasoning} reasoning summaries, `
     + `${totals.tools} tool calls, ${totals.injected} injected messages dropped, ${totals.truncated} outputs truncated`,
+  )
+  if (totals.history > 0) console.log(
+    `${totals.history} message(s) recovered from compaction history (present nowhere else in the Codex log)`,
   )
   if (totals.images > 0) {
     // The attachment store only exists inside a running harness, and it
