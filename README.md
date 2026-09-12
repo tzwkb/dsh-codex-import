@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-blue.svg)](cordis.patch.yml)
-[![Node](https://img.shields.io/badge/Node-18%2B-blue.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/Node-22.15%2B-blue.svg)](https://nodejs.org/)
 
 English | [中文](README_ZH.md)
 
@@ -12,13 +12,16 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 ## What it does
 
-- Groups Codex rollout segments into conversations. One conversation spans several `rollout-*.jsonl` files that share a `session_id`; file mtime is not a recency signal, and the filename suffix is not the session id.
+- Groups Codex rollout segments into conversations. One conversation spans several `rollout-*.jsonl` or compressed `rollout-*.jsonl.zst` files; newer files may identify the segment with `payload.id` and the conversation root with the metadata lineage. File mtime is not a recency signal, and the filename suffix is not the session id.
 - Converts each conversation into a DSH session v3 log — turns, steps, messages, tool calls and results, reasoning summaries, and images.
 - Recovers the model's thinking as far as it is recoverable: Codex ships reasoning as a server-keyed Fernet token, and about a third of those records also carry a plaintext `summary` that becomes a `reasoning` block.
 - Admits attached images through the DSH attachment store, so they render in the transcript and reach the model again.
-- Drops Codex's own context injection (`<recommended_plugins>`, `<environment_context>`, `<skill>`, `# AGENTS.md instructions`, …), so the opening turn and the derived session title are the human's words.
-- Verifies every converted session with the harness's own validators plus a tool-call pairing check, and **only then** copies it into the sessions root. Existing sessions are never overwritten.
-- Writes a rollback manifest, so an import can be undone with one command.
+- Drops Codex's own context injection (`<recommended_plugins>`, `<environment_context>`, `<permissions instructions>`, IDE/application envelopes, `# AGENTS.md instructions`, …), while unwrapping the human section when an envelope contains `## My request for Codex:`.
+- Repairs interrupted tool rounds in both directions: a result without its call gets an explicit `codex_orphaned_tool` placeholder, and a call without a flushed result gets a deterministic error result. Both remain resumable and are counted in the report.
+- Preserves newer `local_shell_call`/`shell_call` records and correlates Codex completion events, so non-zero exits and failed MCP/patch calls remain visibly marked as tool errors.
+- Verifies every converted session with the harness's own validators plus a tool-call pairing check, and **only then** publishes it. Importer-owned two-frame sessions may be refreshed in place; continued, foreign, malformed, or symlinked sessions are left alone.
+- Writes an immutable per-run rollback manifest (plus a latest pointer), so an import can be undone safely even after a later no-op run.
+- Scans rollouts in bounded memory: inventory keeps paths and timestamps only, then conversion loads one conversation at a time. A targeted `--session` scan reads a bounded metadata prefix before deciding whether to read each body.
 
 ## Install
 
@@ -41,7 +44,12 @@ Inside a `dsh-tui` session:
 /import-codex                      # lists too — nothing is written without a scope
 /import-codex --since-hours 168    # last week
 /import-codex --session <id>       # one Codex session id (repeatable)
+/import-codex --limit 10           # newest 10 after filtering
+/import-codex --project /repo      # this project and its descendants
+/import-codex --archived           # include archived Codex sessions
+/import-codex --codex-root /backup/codex/sessions  # alternate source
 /import-codex --max-tool-output 4000  # smaller sessions, at the cost of detail
+/import-codex --no-images          # skip attachment admission
 /import-codex --dry-run            # convert and verify, write nothing
 /import-codex --force              # refresh even a session you continued in DSH
 /import-codex --help
@@ -54,11 +62,13 @@ The same work is available from a shell, without a running harness:
 ```sh
 node bin/import-codex.mjs list    --since-hours 168
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check
+node bin/import-codex.mjs sync    --codex-root /backup/codex/sessions --dsh-home /tmp/dsh --dry-run
 node bin/import-codex.mjs verify  /tmp/import-check
-node bin/import-codex.mjs sync    --since-hours 24      # into $DSH_HOME/sessions
+node bin/import-codex.mjs sync    --since-hours 24      # into $DSH_TUI_SESSION_ROOT or $DSH_HOME/sessions
+node bin/import-codex.mjs rollback --manifest /path/to/codex-import-manifests/<run>.json
 ```
 
-`convert` writes a directory and stops there, so the result can be inspected first. `sync` is the same pipeline aimed at a live sessions root: convert to a scratch directory, verify, then reconcile session by session. Both open the attachment store directly, so the CLI imports images just as `/import-codex` does.
+`convert` writes a directory and stops there, so the result can be inspected first. `sync` is the same pipeline aimed at a live sessions root: convert to a scratch directory, verify, then reconcile session by session. `--dry-run` uses that same scratch-and-verify path and removes the scratch tree afterward; it does not open or mutate the attachment store. Both normal CLI commands open the attachment store directly, so they import images just as `/import-codex` does. `--codex-root` is useful for an archived export, and `--dsh-home` selects a profile's attachment home; an explicit `--into` or `DSH_TUI_SESSION_ROOT` takes precedence for the live sessions root.
 
 ## Re-running is incremental
 
@@ -71,7 +81,7 @@ Importing the same conversation again is safe, and cheap when nothing changed. E
 | Content differs | **Refreshed in place** — same session id and directory, so `/resume` entries and workspace state stay valid. This is how a conversation that grew in Codex, or one imported before a converter change, is brought up to date. |
 | Not the file this importer wrote | **Left alone.** |
 
-The last case matters most. DSH appends one zstd frame per event batch, so a session you have continued inside DSH is no longer a two-frame log; rewriting it would delete your turns. A log at two frames whose digest does not match what the importer recorded is one something else rewrote, and is treated the same way. `--force` overrides this, and is destructive by design. A conversion that could not reach the attachment store is also refused rather than allowed to overwrite a log that holds images.
+The last case matters most. DSH appends one zstd frame per event batch, so a session you have continued inside DSH is no longer a two-frame log; rewriting it would delete your turns. A log at two frames whose digest does not match what the importer recorded is one something else rewrote, and is treated the same way. `--force` overrides this, and is destructive by design. A conversion that could not reach the attachment store is also refused rather than allowed to overwrite a log that holds images. A sync writes `codex-import-state.json` beside the sessions root; runs that install or refresh sessions also keep a run-specific JSON manifest under `codex-import-manifests/`. A no-op run preserves the previous manifest and its rollback history, while the text manifest remains only for older scripts.
 
 Nothing is ever deleted, and no session is ever imported twice: a refresh replaces the file, keeping the directory, any sibling files, and the session id.
 
@@ -79,9 +89,9 @@ Nothing is ever deleted, and no session is ever imported twice: a refresh replac
 
 | | Result |
 | --- | --- |
-| Messages, tool calls and results | Imported in full. `--max-tool-output N` truncates each tool output to N chars if you need smaller sessions; the default is 0, which keeps everything. |
+| Messages, tool calls and results | Imported in full. `--max-tool-output N` truncates each tool output to N chars if you need smaller sessions; the default is 0, which keeps everything. Missing calls/results are repaired with explicit placeholders and counted; non-zero exits remain marked as errors. |
 | Reasoning | Only the plaintext `summary`, for roughly a third of records. The rest is a Fernet token keyed by OpenAI and cannot be read by any client. |
-| Images | Imported, through the attachment store. Reported, never dropped silently. |
+| Images | Imported through the attachment store, including App Server and telemetry-side user images plus structured image-generation results. Oversized inline base64 is rejected before allocation; valid image-store refusals are reported. |
 | Codex-injected context | Dropped. The `# Files mentioned by the user:` envelope is unwrapped rather than dropped, because it wraps the human's actual prompt. |
 | Compaction markers, world state, token counts, inter-agent envelopes | Dropped: context plumbing rather than conversation. Messages that survive *only* inside a compaction's `replacement_history` are recovered. |
 | Codex tool names (`exec`, `shell`, …) | Preserved verbatim as history the model can read; they are not callable in DSH. |
@@ -111,7 +121,7 @@ DSH validates a session log three times, and the weaker checks are not enough �
 ## Requirements
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with the `dsh-tui` profile installed
-- Node.js 18+ (the plugin runs inside the harness)
+- Node.js 22.15+ (the converter and verifier use Node's native Zstandard API)
 - Codex data under `$CODEX_HOME/sessions` (default `~/.codex/sessions`)
 
 ## Development
@@ -124,10 +134,11 @@ scripts/reinstall.sh          # re-copies into the dsh-tui profile, then restart
 
 `scripts/reinstall.sh <profile>` targets another profile. Re-running `dsh plugin add` refreshes an existing `file:` dependency in place; removing first is not required.
 
-Tests run against a real Codex corpus and a throwaway `DSH_HOME`, so they need no mocks and leave nothing behind:
+Tests use a synthetic Codex corpus and a throwaway `DSH_HOME` under `.test-work`, so they never read your personal history. Verification loads a pinned DSH runtime downloaded into `.test-runtime`; no global DSH, `~/.dsh`, or `~/.codex` data is touched. The deterministic regression suite also covers malformed input, zstd magic collisions, bounded discovery, dry-run side effects, rollback history, and symlink guards:
 
 ```sh
-npm test              # reconcile behaviour, then the composed /import-codex command
+npm run test:setup     # once per clone: download the isolated DSH test runtime
+npm test              # deterministic regressions, reconcile behaviour, then /import-codex
 node scripts/test-sync.mjs --keep     # leave the scratch tree for inspection
 ```
 

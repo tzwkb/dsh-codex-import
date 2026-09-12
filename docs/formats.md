@@ -42,7 +42,7 @@ Encoding (mirror `dsh-session-persistence-jsonl`; do not invent):
 - `seq` is contiguous from 0 across all events (the header carries none).
 - Directory mode `700`, log mode `600`.
 
-Physical layout — plain concatenated zstd frames:
+Physical layout — concatenated, independently checksummed zstd frames:
 
 - **Frame 1**: the `session` header record as one JSON line plus `\n`, nothing else.
 - **Frame 2+**: event lines, each `\n`-terminated.
@@ -60,9 +60,12 @@ has been, and is left alone. Pairing the frame count with a digest of the body
 covers the remaining case — a log the harness rewrote wholesale, which can fold
 back down to two frames while carrying turns this importer never wrote.
 
-Frame boundaries are found by scanning for the zstd magic and confirming that
-decompressing both the prefix and the remainder succeeds, so a magic-shaped byte
-sequence inside compressed data is not mistaken for a boundary.
+Frame boundaries are read from the standard Zstandard frame header and block
+headers. A zstd magic sequence can occur inside compressed data, so scanning for
+that byte pattern is not sufficient; `lib/verify.js` walks each block, accounts
+for optional checksums, and only then passes the exact frame slice to Node's
+decompressor. Truncated blocks and reserved header values are rejected before a
+session can be classified as importer-owned.
 
 ## DSH event mapping
 
@@ -88,6 +91,13 @@ level. If a `request/header` is emitted at all, its `data.reason` must be one of
 `initial`, `resume`, `change`, or `series` — the converter omits that event
 entirely, which is valid.
 
+The importer reduces string, content-item array, and common structured tool
+outputs (`content`, `body`, and `success`) to readable text. Completion events
+such as `exec_command_end` are correlated by `call_id`; a non-zero exit code,
+explicit failure, error payload, or failed/cancelled status sets
+`tool-result.isError`. The CLI reports failed tool results separately from
+repaired or missing calls.
+
 ### Why tool calls need two representations
 
 The provider adapter (`dsh-llm-deepseek`) builds the wire `tool_calls` array
@@ -106,11 +116,26 @@ Codex model responses that consist only of tool calls (no text) have no
 assistant message to hang the block on, so the converter synthesizes one. The
 `synthesized` counter in the CLI output reports how many times that happened.
 
+An interrupted rollout can contain a `function_call_output` without its
+preceding call. Emitting that result alone would pass storage validation but
+would fail on the next provider request. The converter inserts a
+`codex_orphaned_tool` call with the recovered output, increments
+`repairedTools`, and reports the repair so the source rollout can be inspected.
+The inverse can happen when a run is cancelled after the model emits a call:
+before closing that step the converter appends a deterministic error result,
+`[Codex import: the tool call was recorded without an output]`, and counts the
+repair as well. This keeps the provider's tool-call balance closed at the end of
+the imported history.
+
 ## Codex rollout inventory
 
-One conversation spans one or more `rollout-*.jsonl` files sharing a
-`session_id`; segments are time-contiguous, so ordering by record timestamp
-(then `ordinal`) reproduces it without duplication.
+One conversation spans one or more `rollout-*.jsonl` or
+`rollout-*.jsonl.zst` files. Older files identify themselves with
+`session_meta.payload.session_id`; newer Codex builds write a per-segment
+`payload.id` and may append lineage metadata whose `session_id` is the
+conversation root. The importer groups by that root, retains every source id
+for `--session` selection, skips records marked as sub-agent transcripts, and
+folds cumulative duplicate messages before ordering by timestamp and `ordinal`.
 
 **Select by the timestamp in the filename** (`rollout-YYYY-MM-DDTHH-MM-SS-…`),
 never by mtime: Codex rewrites old rollouts, so a stale file can carry today's
@@ -121,10 +146,13 @@ matches `session_meta.session_id` for current Codex Desktop builds, but across a
 300-file sample it matched only 8% of the time — older builds put a per-file
 uuid there. The id must come from the record.
 
-**`session_meta` is always the first line** (400/400 sampled) and carries the
-`session_id`, so `collectConversations` decides id filtering from the first
-record alone: `--session <id>` over a 4.5 GB corpus reads kilobytes, not
-gigabytes.
+The importer scans a bounded metadata prefix from each file. It uses the first
+metadata id as the file's own source id, the last lineage/root id when present,
+and the legacy `session_id` fallback when no lineage exists. That lets
+`--session <id>` select a conversation without loading every body; conversion
+then reads one selected conversation at a time. Codex may compress cold files
+as `.jsonl.zst`; the metadata probe recognizes them and decompresses the file
+to inspect its metadata before conversion loads the selected records.
 
 ## Images
 
@@ -154,29 +182,39 @@ That has two consequences the code is built around:
   every distinct image, then the synchronous `buildRecords` looks each one up by
   the sha256 of its *original* bytes (a lookup key only, never a stored
   identifier) and emits the block.
-- **Only the plugin can import images.** The standalone CLI has no attachment
-  store, so `runImport` takes an optional `saveImages`; without it images are
-  counted as skipped and reported loudly rather than dropped silently. That is
-  why `bin/import-codex.mjs` warns instead of importing them.
+- `runImport` takes an optional `saveImages`. The composed plugin supplies the
+  active store, and the standalone CLI opens the local store when available;
+  callers that omit it get a loud count of skipped images rather than silent
+  data loss. `--dry-run` deliberately omits the callback so a read-only check
+  cannot create attachment objects.
 
 Images are admitted one at a time so a single refusal (unsupported media type,
 too many pixels, oversized) costs that image only, and refusals are reported.
+Inline base64 is size-checked before decoding (`MAX_IMAGE_BYTES` defaults to
+64 MiB), so a pathological rollout cannot allocate an unbounded buffer merely
+by being scanned.
 The store accepts `image/png`, `image/jpeg`, `image/webp`, and `image/gif`.
 
 | Codex record | Mapping |
 | --- | --- |
 | `session_meta` | session header (`cwd`, `model_provider`, `model`) |
-| `event_msg` `task_started` / `task_complete` / `turn_aborted` | `turn/start` / `turn/end`; aborted and errored completions become `interrupted` |
+| `event_msg` `task_started` / `task_complete` / `turn_aborted` (and App Server `turn_*` aliases) | `turn/start` / `turn/end`; aborted and errored completions become `interrupted` |
+| `event_msg` `user_message` | Used as a crash-safe user-message fallback when no matching `response_item` exists; duplicate telemetry is ignored |
 | `response_item` `message` (role `user` / `assistant`) | `user/message` / `assistant/message` |
 | `response_item` `message` (role `developer`) | dropped — Codex app context |
 | `response_item` `function_call` / `custom_tool_call` | `tool/call` + content block |
 | `response_item` `function_call_output` / `custom_tool_call_output` | `tool/result` |
+| `response_item` `local_shell_call` / `shell_call` (and their outputs) | `tool/call` / `tool/result`; structured output text is preserved |
 | `response_item` `reasoning` | plaintext `summary` only, as a `reasoning` block |
+| `response_item` App Server `userMessage` / `agentMessage` / `plan` | normalized to the corresponding user or assistant message |
+| `response_item` `commandExecution` / `fileChange` / `mcpToolCall` / `dynamicToolCall` / `webSearch` | normalized to a paired tool call/result; structured output and failure status are retained |
 | `response_item` `tool_search_call` / `tool_search_output` | `tool/call` / `tool/result` (`tool_search`) |
-| `response_item` `web_search_call` | `tool/call` (`web_search`); no output record exists |
+| `response_item` `web_search_call` | `tool/call` + generated successful placeholder result when Codex has no output record |
+| `response_item` `imageGeneration` / `image_generation_call` (including `result.b64_json`/`b64Json`) | balanced `image_generation` call/result with an attachment-store image when the payload contains a supported image |
 | `response_item` `agent_message` | dropped — inter-agent envelope, mostly encrypted |
 | `compacted`, `world_state`, `turn_context`, `token_usage_record`, `inter_agent_communication_metadata` | dropped — context plumbing, not transcript |
-| `event_msg` `item_completed`, `token_count`, `thread_settings_applied` | dropped |
+| `event_msg` `exec_command_end` / other call completion events | correlated by `call_id`; non-zero exit, error, or failed status marks `tool/result.isError` |
+| `event_msg` `item_completed`, `token_count`, `thread_settings_applied` | dropped — context plumbing, not transcript |
 
 ## What Codex injects as the user's own words
 
@@ -185,14 +223,17 @@ opens the session with scaffolding instead of the human's prompt — and the
 harness derives the session title from that first message. Drop messages whose
 text starts with one of these tags:
 
-`<recommended_plugins>`, `<environment_context>`, `<skill>`, `<turn_aborted>`,
-`<in-app-browser-context>`, `<app-context>`, `<user_instructions>`,
+`<recommended_plugins>`, `<environment_context>`, `<permissions instructions>`,
+`<skill>`, `<turn_aborted>`, `<in-app-browser-context>`, `<app-context>`,
+`<user_instructions>`, `<pending_input>`, `<codex_internal_context>`,
+`<user_shell_context>`, `<request_id>`, `<model>`, `<turn_id>`, or
 `# AGENTS.md instructions`.
 
-`# Files mentioned by the user:` is the exception: that envelope wraps the real
-prompt after a `## My request for Codex:` marker, so extract that section
-instead of dropping the message. Over-filtering silently deletes things the
-human actually typed, which is worse than keeping scaffolding.
+`# Files mentioned by the user:`, `# Applications mentioned by the user:`, and
+`# Context from my IDE setup:` are envelopes. When they contain a
+`## My request for Codex:` (or `## My request:`) marker, the importer extracts
+the human section; a pure envelope is dropped. The same rule applies to the
+Codex agent-history preamble.
 
 ## Codex reasoning cannot be decrypted
 
@@ -209,6 +250,27 @@ analysis**"`). The converter emits these as `{type:"reasoning", text}` blocks.
 `reasoning.content` is always null in the corpus, and `event_msg`
 `item_completed` `Reasoning` items duplicate the same summaries exactly — no
 additional plaintext exists.
+
+## Memory and publication safety
+
+Discovery first builds lightweight references containing only each rollout path,
+its filename timestamp, and ids read from a bounded metadata prefix. Conversion
+then loads and releases one conversation at a time. This keeps a multi-gigabyte
+Codex history from becoming one giant in-memory object; `collectConversations`
+remains available for callers that explicitly want the eager API.
+
+The sync path stages a new session beside its destination and renames it into
+place only after the source is complete. Existing destination ancestors and log
+symlinks are refused, and a malformed source cannot abort valid siblings. State
+and manifests are written atomically with restrictive permissions. A sync updates
+the state file; when it installs or refreshes a session it also writes an
+immutable JSON manifest under `codex-import-manifests/<run-id>.json`, updates the
+convenience `codex-import-manifest.json`, and keeps the pre-0.2 text file for
+compatibility. A no-op sync leaves the previous manifest and its timestamps
+untouched. Rollback checks the recorded body digest before removing or restoring
+anything, so a session changed after import is skipped. Rollback outcomes are
+written separately under `codex-import-rollback-results/`, leaving the archived
+import manifest unchanged.
 
 ## Defaults and their cost
 

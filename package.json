@@ -23,7 +23,7 @@
   },
   "homepage": "https://github.com/tzwkb/dsh-codex-import#readme",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.15"
   },
   "main": "lib/index.js",
   "bin": {
@@ -53,7 +53,9 @@
     }
   },
   "scripts": {
-    "test": "node scripts/test-sync.mjs && node scripts/test-plugin.mjs",
+    "test:setup": "npm install --prefix .test-runtime --no-save --package-lock=false --ignore-scripts --cache .test-runtime/npm-cache @deepseek-ai/dsh@0.1.5-rc.1",
+    "test": "node scripts/test-regressions.mjs && node scripts/test-sync.mjs && node scripts/test-plugin.mjs",
+    "test:regressions": "node scripts/test-regressions.mjs",
     "test:sync": "node scripts/test-sync.mjs",
     "test:plugin": "node scripts/test-plugin.mjs",
     "list": "node bin/import-codex.mjs list"

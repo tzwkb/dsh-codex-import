@@ -14,45 +14,17 @@
  *   a real run installs a session that passes the harness validators;
  *   a second real run reports it as already up to date and writes nothing.
  *
- * By default it pins one conversation that nothing has written to for ten
- * minutes, because a session still being generated would legitimately change
- * between the two runs. `--session ID` and `--since-hours N` override that.
+ * The test creates a fixed two-segment fixture inside the repository, so it is
+ * deterministic and never scans a user's live Codex corpus.
  */
-import { mkdtempSync, rmSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
 import assert from 'node:assert/strict'
 import { openAttachmentStore } from '../lib/store.js'
-import { findRollouts, collectConversations } from '../lib/convert.js'
+import { createCodexFixture } from './test-fixture.mjs'
 
 const argv = process.argv.slice(2)
 const optOf = (flag) => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined)
-const sinceHours = optOf('--since-hours') === undefined ? 24 : Number(optOf('--since-hours'))
-
-/**
- * Choose a conversation nothing is writing to at the moment.
- *
- * The Codex corpus is live — a session the user is still running grows between
- * two imports. "A second run changes nothing" is only a meaningful assertion
- * for a conversation that has stopped moving, so quiescence is read from the
- * rollout file mtime rather than assumed.
- */
-function pickQuietSession(quietMinutes = 10) {
-  const now = Date.now()
-  const candidates = []
-  for (const convo of collectConversations(findRollouts(sinceHours))) {
-    const newest = Math.max(...convo.segments.map((s) => statSync(s.path).mtimeMs))
-    if (now - newest < quietMinutes * 60_000) continue
-    candidates.push({
-      sessionId: convo.sessionId,
-      records: convo.segments.reduce((n, s) => n + s.records.length, 0),
-    })
-  }
-  candidates.sort((a, b) => a.records - b.records)
-  // Prefer a conversation with some substance; a five-record stub exercises the
-  // plumbing without exercising much of the mapping.
-  return candidates.find((c) => c.records > 40) ?? candidates.find((c) => c.records > 4)
-}
 
 let passed = 0
 let failed = 0
@@ -67,11 +39,15 @@ const check = (name, fn) => {
   }
 }
 
-const home = mkdtempSync(join(tmpdir(), 'codex-plugin-test-'))
+const fixture = createCodexFixture('codex-plugin-test')
+const home = join(fixture.root, 'dsh-home')
 const root = join(home, 'sessions')
-// The plugin resolves its sessions root from DSH_HOME at call time, so pointing
-// the environment at a temp home is enough to keep the real store untouched.
+const previousDshHome = process.env.DSH_HOME
+const previousCodexHome = process.env.CODEX_HOME
+const previousSessionRoot = process.env.DSH_TUI_SESSION_ROOT
 process.env.DSH_HOME = home
+process.env.CODEX_HOME = join(fixture.root, 'codex')
+delete process.env.DSH_TUI_SESSION_ROOT
 
 /** Compose the plugin exactly as the harness would. */
 function compose(ctx) {
@@ -100,17 +76,14 @@ try {
   })
 
   console.log(`\ndry run and listing write nothing`)
-  const quiet = optOf('--session') === undefined ? pickQuietSession() : undefined
-  const sessionId = optOf('--session') ?? quiet?.sessionId
-  const selection = sessionId === undefined ? `--since-hours ${sinceHours}` : `--session ${sessionId}`
-  console.log(sessionId === undefined
-    ? `selection: --since-hours ${sinceHours} (no quiescent conversation found to pin)`
-    : `selection: ${selection}  (${quiet?.records ?? 'given'} records, quiet for 10+ min)`)
+  const sessionId = optOf('--session') ?? fixture.primaryId
+  const selection = `--session ${sessionId}`
+  console.log(`selection: ${selection}  (isolated fixture)`)
 
   const listed = await command.handler({ rawInput: '' })
   check('a bare invocation lists instead of importing', () => {
     assert.equal(listed.kind, 'success')
-    assert.match(listed.text, /conversation\(s\) in the last 24 h/)
+    assert.match(listed.text, /conversation\(s\) in the last 24 h|No conversations started in the last 24 h/)
     assert.equal(existsSync(root), false, 'listing created the sessions root')
   })
 
@@ -126,6 +99,7 @@ try {
   check('a real run installs sessions', () => {
     assert.equal(first.kind, 'success', first.text)
     assert.match(first.text, /new/)
+    assert.match(first.text, /image\(s\) attached/i)
     assert.ok(existsSync(root))
   })
   const installed = []
@@ -150,15 +124,33 @@ try {
     assert.doesNotMatch(second.text, /left alone/)
   })
 
+  const limited = await command.handler({ rawInput: '--limit 1' })
+  check('a selector without --since-hours still imports instead of listing', () => {
+    assert.equal(limited.kind, 'success', limited.text)
+    assert.match(limited.text, /already up to date|new|refreshed/)
+    assert.doesNotMatch(limited.text, /conversation\(s\) in the last/)
+  })
+
   console.log(`\nthe installed logs pass the harness validators`)
-  const { verifyPaths } = await import('../lib/verify.js')
+  const { verifyPaths, readSessionLog } = await import('../lib/verify.js')
   const verified = await verifyPaths([root], { quiet: true })
   check(`${verified.passed} log(s) valid, ${verified.failed} invalid, ${verified.events} events`, () => {
     assert.equal(verified.failed, 0)
     assert.ok(verified.events > 0)
   })
+  check('the real attachment store leaves an image reference in the log', () => {
+    const log = join(installed[0], 'session.v3.jsonl.zstd')
+    assert.equal(readSessionLog(log).hasImages, true)
+    assert.ok(existsSync(store.root), 'attachment store did not create its root')
+  })
 } finally {
-  rmSync(home, { recursive: true, force: true })
+  if (previousDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = previousDshHome
+  if (previousCodexHome === undefined) delete process.env.CODEX_HOME
+  else process.env.CODEX_HOME = previousCodexHome
+  if (previousSessionRoot === undefined) delete process.env.DSH_TUI_SESSION_ROOT
+  else process.env.DSH_TUI_SESSION_ROOT = previousSessionRoot
+  fixture.cleanup()
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

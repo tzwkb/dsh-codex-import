@@ -20,16 +20,16 @@
  *
  * Usage: node scripts/test-sync.mjs [--session ID] [--keep]
  */
-import { mkdtempSync, rmSync, mkdirSync, cpSync, writeFileSync, readFileSync, statSync, readdirSync } from 'node:fs'
+import { mkdirSync, cpSync, writeFileSync, readFileSync, statSync, readdirSync } from 'node:fs'
 import { join, relative } from 'node:path'
-import { tmpdir } from 'node:os'
 import { zstdCompressSync } from 'node:zlib'
 import assert from 'node:assert/strict'
 import {
-  runImport, sessionBody, serializeSession, collectConversations, collectImages, findRollouts,
+  runImport, sessionBody, serializeSession,
 } from '../lib/convert.js'
-import { syncSessions, writeManifest, readState } from '../lib/sync.js'
+import { syncSessions, writeManifest, readState, statePath, manifestPath } from '../lib/sync.js'
 import { verifyPaths, readSessionLog } from '../lib/verify.js'
+import { createCodexFixture } from './test-fixture.mjs'
 
 const argv = process.argv.slice(2)
 const optOf = (flag) => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined)
@@ -48,11 +48,13 @@ const check = (name, fn) => {
   }
 }
 
-const root = mkdtempSync(join(tmpdir(), 'codex-sync-test-'))
+const fixture = createCodexFixture('codex-sync-test')
+const root = fixture.root
+const codexRoot = fixture.codexRoot
 const convert = async (name, maxToolOutput) => {
   const out = join(root, `scratch-${name}`)
   mkdirSync(out, { recursive: true })
-  const { results } = await runImport({ root: out, sessionIds: [sessionId], maxToolOutput })
+  const { results } = await runImport({ root: out, codexRoot, sessionIds: [sessionId], maxToolOutput })
   assert.equal(results.length, 1, `expected exactly one conversation for ${sessionId}`)
   return { out, result: results[0] }
 }
@@ -64,42 +66,12 @@ const live = (name) => {
 const logOf = (liveRoot, rel) => join(liveRoot, rel, 'session.v3.jsonl.zstd')
 const keyOf = (result, scratchRoot) => relative(scratchRoot, result.dir)
 
-/** Total tool-output bytes — the size that decides whether truncation shows. */
-function longestOutput(convo) {
-  let max = 0
-  for (const seg of convo.segments) {
-    for (const r of seg.records) {
-      if (r.type !== 'response_item') continue
-      if (!/function_call_output|custom_tool_call_output/.test(r.payload?.type ?? '')) continue
-      const text = typeof r.payload.output === 'string' ? r.payload.output : JSON.stringify(r.payload.output ?? '')
-      max = Math.max(max, text.length)
-    }
-  }
-  return max
-}
-
-let sessionId = optOf('--session')
-let imageSessionId
+let sessionId = optOf('--session') ?? fixture.primaryId
+const imageSessionId = fixture.imageId
 
 try {
-  // One pass over the recent corpus, reused by every case below. Scanning the
-  // whole rollout history here would read gigabytes to answer the same question.
-  const conversations = collectConversations(findRollouts(24))
-  if (sessionId === undefined) {
-    // The cheapest conversation whose output is long enough to be truncated.
-    const pick = conversations
-      .filter((c) => longestOutput(c) > 10_000)
-      .sort((a, b) => a.segments.reduce((n, s) => n + s.records.length, 0)
-        - b.segments.reduce((n, s) => n + s.records.length, 0))[0]
-    assert.ok(pick !== undefined, 'no conversation in the last 24 h has a tool output over 10 000 chars')
-    sessionId = pick.sessionId
-  }
-  imageSessionId = conversations
-    .filter((c) => collectImages([c]).size > 0)
-    .sort((a, b) => collectImages([a]).size - collectImages([b]).size)[0]?.sessionId
-
   console.log(`session under test:  ${sessionId}`)
-  console.log(`image-bearing:       ${imageSessionId ?? '(none in the last 24 h)'}`)
+  console.log(`image-bearing:       ${imageSessionId}`)
   console.log(`scratch:             ${root}`)
 
   section('conversion is deterministic')
@@ -135,10 +107,32 @@ try {
     assert.equal(statSync(logOf(liveA, key)).mtimeMs, mtimeBefore)
     assert.deepEqual(readFileSync(logOf(liveA, key)), installedBefore)
   })
-  check('the rollback list names the session', () => {
+  check('a no-op sync does not rewrite ownership metadata', () => {
+    const metadata = statSync(statePath(liveA))
+    const third = syncSessions(full.out, liveA, [full.result])
+    assert.equal(third.unchanged.length, 1)
+    const after = statSync(statePath(liveA))
+    assert.equal(after.ino, metadata.ino)
+    assert.equal(after.mtimeMs, metadata.mtimeMs)
+  })
+  check('the rollback manifest names only sessions created by this run', () => {
     writeFileSync(join(liveA, key, 'sibling.txt'), 'keep me\n')
-    const manifest = writeManifest(liveA, second)
-    assert.deepEqual(readFileSync(manifest, 'utf8').trim().split('\n'), [join(liveA, key)])
+    const manifest = writeManifest(liveA, first)
+    const detail = JSON.parse(readFileSync(manifest, 'utf8'))
+    assert.deepEqual(detail.remove.map((entry) => entry.key), [key])
+    assert.deepEqual(detail.restore, [])
+    assert.equal(detail.version, 2)
+  })
+  check('a no-op manifest call preserves the previous rollback record', () => {
+    const latest = manifestPath(liveA)
+    const before = readFileSync(latest)
+    const metadata = statSync(latest)
+    const noOp = syncSessions(full.out, liveA, [full.result])
+    writeManifest(liveA, noOp)
+    const after = statSync(latest)
+    assert.deepEqual(readFileSync(latest), before)
+    assert.equal(after.ino, metadata.ino)
+    assert.equal(after.mtimeMs, metadata.mtimeMs)
   })
 
   section('changed content is refreshed in place')
@@ -207,7 +201,7 @@ try {
     console.log('  SKIP  no image-bearing conversation is available in the last 24 h')
   } else {
     const out = join(root, 'scratch-images')
-    const { results } = await runImport({ root: out, sessionIds: [imageSessionId] })
+    const { results } = await runImport({ root: out, codexRoot, sessionIds: [imageSessionId] })
     const [imgResult] = results
     check('the store-less conversion skips its images', () => {
       assert.ok(imgResult.stats.imagesSkipped > 0, 'expected images to be skipped without a store')
@@ -242,7 +236,7 @@ try {
   })
 } finally {
   if (argv.includes('--keep')) console.log(`\nkept: ${root}`)
-  else rmSync(root, { recursive: true, force: true })
+  else fixture.cleanup()
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

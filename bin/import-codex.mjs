@@ -5,6 +5,7 @@
  *   import-codex list    [--since-hours N]
  *   import-codex convert --out DIR [--since-hours N | --session ID]... [--dry-run]
  *   import-codex sync    [--into SESSIONS_ROOT] [same selection flags] [--force]
+ *   import-codex rollback [--manifest PATH]
  *   import-codex verify  PATH...
  *
  * `convert` writes a directory of session logs and stops there, so the result
@@ -13,39 +14,121 @@
  * then reconcile session by session against what is already installed. `verify`
  * also accepts a conversion output directory.
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { runImport, listConversations } from '../lib/convert.js'
 import { verifyPaths } from '../lib/verify.js'
-import { syncSessions, writeManifest, manifestPath, readState } from '../lib/sync.js'
+import { syncSessions, writeManifest, manifestPath, readState, rollbackManifest } from '../lib/sync.js'
 import { openAttachmentStore, resolveDshHome } from '../lib/store.js'
+
+/** Keep disposable conversion trees under an explicit root when a caller needs isolation. */
+function scratchRoot() {
+  const configured = process.env.DSH_CODEX_IMPORT_TMP_ROOT
+  return typeof configured === 'string' && configured.length > 0 ? configured : tmpdir()
+}
+
+const COMMANDS = new Set(['list', 'convert', 'sync', 'rollback', 'verify'])
+const USAGE = `Usage: import-codex <command> [options]
+
+Commands:
+  list       list conversations available for import
+  convert    write converted session logs to --out DIR
+  sync       verify and reconcile converted logs into a sessions root
+  rollback   undo the most recent sync described by a manifest
+  verify     validate one or more session directories
+
+Selection and paths:
+  --session ID          import one Codex session (repeatable)
+  --since-hours N       select rollouts from the last N hours (default 24)
+  --limit N              keep the newest N conversations after filtering
+  --project DIR          restrict imports to this project path (or descendants)
+  --archived             include $CODEX_HOME/archived_sessions
+  --codex-root DIR       read Codex rollouts from DIR instead of $CODEX_HOME/sessions
+  --out DIR              conversion output directory (convert)
+  --into DIR             live sessions root (sync/rollback)
+  --dsh-home DIR         DSH home used for sessions and attachments
+  --manifest FILE        rollback manifest (default: metadata beside --into)
+
+Conversion options:
+  --max-tool-output N   truncate tool output to N characters (default 0 = keep all)
+  --no-images           skip attachment-store image admission
+  --dry-run             convert and verify, without changing a live root
+  --force               refresh a session that is not importer-owned (destructive)
+
+Examples:
+  import-codex list --since-hours 168
+  import-codex sync --since-hours 24
+  import-codex rollback --manifest /path/to/codex-import-manifest.json
+`
+
+class UsageError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'UsageError'
+    this.exitCode = 2
+  }
+}
+
+function requiredValue(argv, index, option) {
+  const value = argv[index + 1]
+  if (value === undefined || value.startsWith('--')) {
+    throw new UsageError(`${option} requires a value`)
+  }
+  return value
+}
 
 function parse(argv) {
   const opts = {
     out: undefined, into: undefined, sinceHours: 24, sessionIds: [],
-    maxToolOutput: 0, dryRun: false, force: false, images: true, paths: [],
+    maxToolOutput: 0, limit: undefined, project: undefined, includeArchived: false,
+    dryRun: false, force: false, images: true, paths: [],
+    codexRoot: undefined, dshHome: undefined, manifest: undefined,
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--out') opts.out = argv[++i]
-    else if (a === '--into') opts.into = argv[++i]
-    else if (a === '--since-hours') opts.sinceHours = Number(argv[++i])
-    else if (a === '--session') opts.sessionIds.push(argv[++i])
-    else if (a === '--max-tool-output') opts.maxToolOutput = Number(argv[++i])
+    if (a === '--help' || a === '-h') return { help: true }
+    if (a === '--out') { opts.out = requiredValue(argv, i++, a); continue }
+    if (a === '--into') { opts.into = requiredValue(argv, i++, a); continue }
+    if (a === '--codex-root') { opts.codexRoot = requiredValue(argv, i++, a); continue }
+    if (a === '--dsh-home') { opts.dshHome = requiredValue(argv, i++, a); continue }
+    if (a === '--manifest') { opts.manifest = requiredValue(argv, i++, a); continue }
+    if (a === '--since-hours') { opts.sinceHours = Number(requiredValue(argv, i++, a)); continue }
+    if (a === '--limit') { opts.limit = Number(requiredValue(argv, i++, a)); continue }
+    if (a === '--project') { opts.project = requiredValue(argv, i++, a); continue }
+    if (a === '--archived') { opts.includeArchived = true; continue }
+    if (a === '--session') { opts.sessionIds.push(requiredValue(argv, i++, a)); continue }
+    if (a === '--max-tool-output') { opts.maxToolOutput = Number(requiredValue(argv, i++, a)); continue }
     else if (a === '--dry-run') opts.dryRun = true
     else if (a === '--force') opts.force = true
     else if (a === '--no-images') opts.images = false
+    else if (a.startsWith('-')) throw new UsageError(`unknown option: ${a}`)
     else opts.paths.push(a)
+  }
+  if (!Number.isFinite(opts.sinceHours) || opts.sinceHours < 0) {
+    throw new UsageError('--since-hours must be a non-negative number')
+  }
+  if (!Number.isSafeInteger(opts.maxToolOutput) || opts.maxToolOutput < 0) {
+    throw new UsageError('--max-tool-output must be zero or a positive integer')
+  }
+  if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit < 1)) {
+    throw new UsageError('--limit must be a positive integer')
   }
   return opts
 }
 
+function targetSessionsRoot(opts) {
+  return opts.into
+    ?? (typeof process.env.DSH_TUI_SESSION_ROOT === 'string' && process.env.DSH_TUI_SESSION_ROOT.length > 0
+      ? process.env.DSH_TUI_SESSION_ROOT
+      : join(opts.dshHome ?? resolveDshHome(), 'sessions'))
+}
+
 /** Open the attachment store, or explain why images will not come across. */
 async function storeFor(opts) {
-  if (opts.images === false) return undefined
+  if (opts.images === false || opts.dryRun === true) return undefined
   try {
-    return await openAttachmentStore()
+    return await openAttachmentStore(opts.dshHome)
   } catch (error) {
     console.log(`WARNING: could not open the attachment store (${String(error?.message ?? error)})`)
     console.log('         images will be skipped rather than silently attached.')
@@ -59,29 +142,32 @@ function totalsOf(results) {
     records: a.records + r.records,
     reasoning: a.reasoning + r.stats.reasoning,
     tools: a.tools + r.stats.toolCalls,
+    errors: a.errors + (r.stats.toolErrors ?? 0),
+    repaired: a.repaired + (r.stats.repairedTools ?? 0),
     injected: a.injected + r.stats.injected,
     truncated: a.truncated + r.stats.truncated,
     images: a.images + r.stats.imagesSkipped + r.stats.imagesImported,
     imported: a.imported + r.stats.imagesImported,
     history: a.history + r.stats.historyMessages,
-  }), { records: 0, reasoning: 0, tools: 0, injected: 0, truncated: 0, images: 0, imported: 0, history: 0 })
+  }), { records: 0, reasoning: 0, tools: 0, errors: 0, repaired: 0, injected: 0, truncated: 0, images: 0, imported: 0, history: 0 })
 }
 
 function printConversion(results, rollouts, imageRefusals, store) {
   const totals = totalsOf(results)
   console.log(`rollout files scanned: ${rollouts}`)
   console.log(`conversations:         ${results.length}\n`)
-  console.log('conversation          seg  turns  records  reason  tools  synth   cwd')
+  console.log('conversation          seg  turns  records  reason  tools  synth  repair   cwd')
   for (const r of results) {
     console.log(
       `${r.id.slice(8, 28).padEnd(20)} ${String(r.segments).padStart(3)} ${String(r.turns).padStart(6)} `
       + `${String(r.records).padStart(8)} ${String(r.stats.reasoning).padStart(7)} ${String(r.stats.toolCalls).padStart(6)} `
-      + `${String(r.stats.synthesized).padStart(6)}   ${r.cwd}`,
+      + `${String(r.stats.synthesized).padStart(6)} ${String(r.stats.repairedTools ?? 0).padStart(7)}   ${r.cwd}`,
     )
   }
   console.log(
     `\n${results.length} sessions, ${totals.records} records, ${totals.reasoning} reasoning summaries, `
-    + `${totals.tools} tool calls, ${totals.injected} injected messages dropped, ${totals.truncated} outputs truncated`,
+    + `${totals.tools} tool calls (${totals.errors} failed), ${totals.repaired} orphaned tool results repaired, `
+    + `${totals.injected} injected messages dropped, ${totals.truncated} outputs truncated`,
   )
   if (totals.history > 0) console.log(
     `${totals.history} message(s) recovered from compaction history (present nowhere else in the Codex log)`,
@@ -103,95 +189,152 @@ function printConversion(results, rollouts, imageRefusals, store) {
 }
 
 const [command, ...rest] = process.argv.slice(2)
-const opts = parse(rest)
 
-if (command === 'list') {
-  const { rollouts, rows } = listConversations({ sinceHours: opts.sinceHours })
-  if (rows.length === 0) {
-    console.log(`no conversations started in the last ${opts.sinceHours} h (scanned ${rollouts} rollout files)`)
-    process.exit(1)
-  }
-  console.log(`${rows.length} conversation(s) from ${rollouts} rollout file(s), newest first:\n`)
-  console.log('started           last              seg  msgs  session id                              cwd')
-  for (const row of [...rows].reverse()) {
-    console.log(
-      `${row.startedAt.slice(0, 16).replace('T', ' ')}  ${row.lastAt.slice(0, 16).replace('T', ' ')}  `
-      + `${String(row.segments).padStart(3)} ${String(row.prompts).padStart(5)}  ${row.sessionId}  ${row.cwd}`,
-    )
-    if (row.prompt.length > 0) console.log(`                                                          “${row.prompt}”`)
-  }
-  console.log('\nImport one with:  import-codex sync --session <session id>')
-  console.log(`Import the window: import-codex sync --since-hours ${opts.sinceHours}`)
-  process.exit(0)
-} else if (command === 'convert' || command === 'sync') {
-  if (command === 'convert' && !opts.dryRun && opts.out === undefined) {
-    console.error('convert: --out DIR is required (or pass --dry-run)')
-    process.exit(2)
-  }
-  // `sync` converts into a scratch tree and only publishes after verification,
-  // exactly as /import-codex does; nothing is written to a live root unverified.
-  const scratch = command === 'sync' ? mkdtempSync(join(tmpdir(), 'codex-sync-')) : opts.out
-  const target = opts.into ?? join(resolveDshHome(), 'sessions')
+/** Execute the CLI without terminating inside a cleanup-sensitive try/finally. */
+async function main() {
+  let opts
   try {
-    const store = await storeFor(opts)
-    const { rollouts, results, imageRefusals } = await runImport({
-      root: scratch,
-      sinceHours: opts.sinceHours,
-      sessionIds: opts.sessionIds,
-      maxToolOutput: opts.maxToolOutput,
-      dryRun: opts.dryRun,
-      saveImages: store?.saveImages,
+    if (command === '--help' || command === '-h') {
+      console.log(USAGE)
+      return 0
+    }
+    if (!COMMANDS.has(command)) {
+      throw new UsageError(command === undefined
+        ? 'a command is required'
+        : `unknown command: ${command}`)
+    }
+    opts = parse(rest)
+    if (opts.help === true) {
+      console.log(USAGE)
+      return 0
+    }
+    if (command === 'verify' && opts.paths.length === 0) {
+      throw new UsageError('verify requires at least one session directory or root')
+    }
+    if (command !== 'verify' && opts.paths.length > 0) {
+      throw new UsageError(`unexpected positional argument: ${opts.paths[0]}`)
+    }
+    if (command === 'convert' && !opts.dryRun && opts.out === undefined) {
+      throw new UsageError('convert: --out DIR is required (or pass --dry-run)')
+    }
+  } catch (error) {
+    console.error(`${String(error?.message ?? error)}\n\n${USAGE}`)
+    return error?.exitCode ?? 2
+  }
+
+  if (command === 'list') {
+    const { rollouts, rows } = listConversations({
+      sinceHours: opts.sinceHours, codexRoot: opts.codexRoot,
+      includeArchived: opts.includeArchived, project: opts.project,
     })
-    if (results.length === 0) {
-      console.log(`no conversations matched (scanned ${rollouts} rollout files)`)
-      process.exit(1)
+    if (rows.length === 0) {
+      console.log(`no conversations started in the last ${opts.sinceHours} h (scanned ${rollouts} rollout files)`)
+      return 1
     }
-    printConversion(results, rollouts, imageRefusals, store)
-    if (opts.dryRun) {
-      console.log('(dry run — nothing written)')
-      process.exit(0)
+    console.log(`${rows.length} conversation(s) from ${rollouts} rollout file(s), newest first:\n`)
+    console.log('started           last              seg  msgs  session id                              cwd')
+    for (const row of [...rows].reverse()) {
+      console.log(
+        `${row.startedAt.slice(0, 16).replace('T', ' ')}  ${row.lastAt.slice(0, 16).replace('T', ' ')}  `
+        + `${String(row.segments).padStart(3)} ${String(row.prompts).padStart(5)}  ${row.sessionId}  ${row.cwd}`,
+      )
+      if (row.prompt.length > 0) console.log(`                                                          “${row.prompt}”`)
     }
-    const verified = command === 'sync' ? await verifyPaths([scratch], { quiet: true }) : undefined
-    if (verified !== undefined && verified.failed > 0) {
-      console.error(`\nABORTED: ${verified.failed} of ${results.length} sessions failed verification; nothing was installed.`)
-      for (const f of verified.failures.slice(0, 3)) console.error(`  - ${f.log}: ${f.message}`)
-      process.exit(1)
-    }
-    if (command === 'convert') process.exit(0)
+    console.log('\nImport one with:  import-codex sync --session <session id>')
+    console.log(`Import the window: import-codex sync --since-hours ${opts.sinceHours}`)
+    return 0
+  }
 
-    const buckets = syncSessions(scratch, target, results, opts.force)
-    const manifest = writeManifest(target, buckets)
-    console.log(`\nsessions root: ${target}`)
-    console.log(`  ${buckets.installed.length} new, ${buckets.refreshed.length} refreshed, `
-      + `${buckets.unchanged.length} already up to date, ${buckets.refused.length} left alone`)
-    if (buckets.refreshed.length > 0) {
-      console.log('  refreshed in place: session ids are unchanged, so /resume entries stay valid')
-      for (const key of buckets.refreshed.slice(0, 10)) console.log(`    ~ ${key}`)
+  if (command === 'rollback') {
+    const target = targetSessionsRoot(opts)
+    const manifest = opts.manifest ?? manifestPath(target)
+    try {
+      const result = rollbackManifest(manifest)
+      console.log(`rollback: removed ${result.removed}, restored ${result.restored}, skipped ${result.skipped}`)
+      return result.skipped > 0 ? 1 : 0
+    } catch (error) {
+      console.error(`rollback failed: ${String(error?.message ?? error)}`)
+      return 1
     }
-    for (const r of buckets.refused.slice(0, 10)) console.log(`    ! ${r.key} — ${r.reason}`)
-    console.log(`  rollback list: ${manifest} (xargs rm -rf < it)`)
-    console.log(`  state: ${Object.keys(readState(target).sessions).length} session(s) recorded`)
-    process.exit(0)
-  } catch (error) {
-    console.error(String(error?.stack ?? error))
-    process.exit(1)
-  } finally {
-    if (command === 'sync') rmSync(scratch, { recursive: true, force: true })
   }
-} else if (command === 'verify') {
-  if (opts.paths.length === 0) {
-    console.error('verify: give at least one session directory or root')
-    process.exit(2)
+
+  if (command === 'convert' || command === 'sync') {
+    // `sync` converts into a scratch tree and only publishes after verification,
+    // exactly as /import-codex does; nothing is written to a live root unverified.
+    const temporary = command === 'sync' || opts.dryRun === true
+    mkdirSync(scratchRoot(), { recursive: true, mode: 0o700 })
+    const scratch = temporary
+      ? mkdtempSync(join(scratchRoot(), command === 'sync' ? 'codex-sync-' : 'codex-dry-run-'))
+      : opts.out
+    const target = targetSessionsRoot(opts)
+    try {
+      const store = await storeFor(opts)
+      const { rollouts, results, imageRefusals } = await runImport({
+        root: scratch,
+        sinceHours: opts.sinceHours,
+        sessionIds: opts.sessionIds,
+        maxToolOutput: opts.maxToolOutput,
+        limit: opts.limit,
+        project: opts.project,
+        includeArchived: opts.includeArchived,
+        // The scratch tree is disposable. Materialise it even for --dry-run so
+        // the same DSH validators exercise the exact bytes a real sync would use.
+        dryRun: false,
+        codexRoot: opts.codexRoot,
+        saveImages: store?.saveImages,
+      })
+      if (results.length === 0) {
+        console.log(`no conversations matched (scanned ${rollouts} rollout files)`)
+        return 1
+      }
+      const verified = command === 'sync' || opts.dryRun
+        ? await verifyPaths([scratch], { quiet: true })
+        : undefined
+      if (verified !== undefined && verified.failed > 0) {
+        console.error(`\nABORTED: ${verified.failed} of ${results.length} sessions failed verification; nothing was installed.`)
+        for (const f of verified.failures.slice(0, 3)) console.error(`  - ${f.log}: ${f.message}`)
+        return 1
+      }
+      printConversion(results, rollouts, imageRefusals, store)
+      if (opts.dryRun) {
+        console.log(`verified: ${verified.passed} session(s), ${verified.events} events (all verified)`)
+        console.log('(dry run — nothing written)')
+        return 0
+      }
+      if (command === 'convert') return 0
+
+      const buckets = syncSessions(scratch, target, results, opts.force)
+      const manifest = writeManifest(target, buckets)
+      console.log(`\nsessions root: ${target}`)
+      console.log(`  ${buckets.installed.length} new, ${buckets.refreshed.length} refreshed, `
+        + `${buckets.unchanged.length} already up to date, ${buckets.refused.length} left alone`)
+      if (buckets.refreshed.length > 0) {
+        console.log('  refreshed in place: session ids are unchanged, so /resume entries stay valid')
+        for (const key of buckets.refreshed.slice(0, 10)) console.log(`    ~ ${key}`)
+      }
+      for (const r of buckets.refused.slice(0, 10)) console.log(`    ! ${r.key} — ${r.reason}`)
+      if (manifest !== undefined) console.log(`  rollback safely: import-codex rollback --manifest ${manifest}`)
+      console.log(`  state: ${Object.keys(readState(target).sessions).length} session(s) recorded`)
+      return 0
+    } catch (error) {
+      console.error(String(error?.stack ?? error))
+      return 1
+    } finally {
+      if (temporary) rmSync(scratch, { recursive: true, force: true })
+    }
   }
-  try {
-    const result = await verifyPaths(opts.paths)
-    console.log(`\n${result.passed} passed, ${result.failed} failed, ${result.events} events validated`)
-    process.exit(result.failed === 0 ? 0 : 1)
-  } catch (error) {
-    console.error(String(error.message))
-    process.exit(2)
+
+  if (command === 'verify') {
+    try {
+      const result = await verifyPaths(opts.paths)
+      console.log(`\n${result.passed} passed, ${result.failed} failed, ${result.events} events validated`)
+      return result.failed === 0 ? 0 : 1
+    } catch (error) {
+      console.error(String(error.message))
+      return 2
+    }
   }
-} else {
-  console.error('usage: import-codex <list|convert|sync|verify> [options]')
-  process.exit(2)
+  return 2
 }
+
+process.exitCode = await main()

@@ -1,9 +1,16 @@
 # Dependencies (the plugin has none, but a local install may create these)
 node_modules/
+.test-runtime/
+.test-work/
 
 # Local scratch output from bin/import-codex.mjs
 /tmp-import/
 codex-import-manifest.txt
+codex-import-state.json
+codex-import-manifest.json
+codex-import-manifests/
+codex-import-backups/
+codex-import-rollback-results/
 
 # Editor and OS noise
 .DS_Store

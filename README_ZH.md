@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-blue.svg)](cordis.patch.yml)
-[![Node](https://img.shields.io/badge/Node-18%2B-blue.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/Node-22.15%2B-blue.svg)](https://nodejs.org/)
 
 [English](README.md) | 中文
 
@@ -12,13 +12,16 @@
 
 ## 它做什么
 
-- **按会话归并 rollout 分段。** 一个对话会拆成多个共享 `session_id` 的 `rollout-*.jsonl`；文件 mtime 不能代表对话时间，文件名后缀也不等于 session id。
+- **按会话归并 rollout 分段。** 一个对话可能拆成多个 `rollout-*.jsonl` 或压缩的 `rollout-*.jsonl.zst`；新版文件用 `payload.id` 标识分段，再由元数据 lineage 找到根会话。文件 mtime 不能代表对话时间，文件名后缀也不等于 session id。
 - **转换成 DSH session v3 会话日志** —— turn、step、消息、工具调用与结果、思考摘要、图片。
 - **尽可能还原思考过程。** Codex 把 reasoning 存成服务端密钥的 Fernet 令牌，但其中约三分之一的记录另带明文 `summary`，会被转成 `reasoning` 块。
 - **把附图接入 DSH 附件库**，使其能在会话记录里渲染，也能重新送到模型面前。
-- **剔除 Codex 自己注入的上下文**（`<recommended_plugins>`、`<environment_context>`、`<skill>`、`# AGENTS.md instructions` 等），让首轮内容和会话标题是真人说的话。
-- **用 harness 自己的校验器逐一验证，再加一道工具调用配对检查，全部通过后**才写入会话库。已存在的会话绝不覆盖。
-- **生成回滚清单**，一条命令即可撤销一次导入。
+- **剔除 Codex 自己注入的上下文**（`<recommended_plugins>`、`<environment_context>`、`<permissions instructions>`、IDE/应用信封、`# AGENTS.md instructions` 等）；信封里有 `## My request for Codex:` 时会拆出真人部分。
+- **修复中断的工具回合**：结果缺少调用时补出明确命名的 `codex_orphaned_tool` 占位调用；调用缺少结果时补出确定性的错误结果。两种情况都能继续 resume，并在报告里计数。
+- **兼容新版本地 Shell 记录**：保留 `local_shell_call`/`shell_call` 及结构化输出，并关联 Codex 的完成事件，让非零退出、失败的 MCP/补丁调用继续显示为错误。
+- **用 harness 自己的校验器逐一验证，再加一道工具调用配对检查，全部通过后**才发布。由本导入器拥有的两帧会话可以原地刷新；已继续过、外部改写、损坏或含软链接的会话会留在原处。
+- **生成每次运行独立且不可变的回滚清单**（另保留最新清单），后续即使只做了一次无变化重跑，也不会丢掉之前的撤销记录。
+- **控制内存占用**：扫描阶段只保留路径和时间戳，转换阶段一次加载一个对话；指定 `--session` 时先只读每个文件有限的元数据前缀，确认命中后才读正文。
 
 ## 安装
 
@@ -41,7 +44,12 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 /import-codex                      # 同样是列出 —— 不给范围就不写入
 /import-codex --since-hours 168    # 最近一周
 /import-codex --session <id>       # 指定某个 Codex session id（可重复）
+/import-codex --limit 10           # 筛选后取最新 10 个
+/import-codex --project /repo      # 只导入该项目及其子目录
+/import-codex --archived           # 包含 Codex 归档会话
+/import-codex --codex-root /backup/codex/sessions  # 指定另一个来源
 /import-codex --max-tool-output 4000  # 换取更小的会话（代价是细节减少）
+/import-codex --no-images          # 跳过附件库图片写入
 /import-codex --dry-run            # 只转换并校验，不写入
 /import-codex --force              # 连你在 DSH 里继续过的会话也刷新（破坏性）
 /import-codex --help
@@ -54,11 +62,13 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 ```sh
 node bin/import-codex.mjs list    --since-hours 168
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check
+node bin/import-codex.mjs sync    --codex-root /backup/codex/sessions --dsh-home /tmp/dsh --dry-run
 node bin/import-codex.mjs verify  /tmp/import-check
-node bin/import-codex.mjs sync    --since-hours 24      # 直接同步进 $DSH_HOME/sessions
+node bin/import-codex.mjs sync    --since-hours 24      # 进入 $DSH_TUI_SESSION_ROOT 或 $DSH_HOME/sessions
+node bin/import-codex.mjs rollback --manifest /path/to/codex-import-manifests/<run>.json
 ```
 
-`convert` 只写出一个目录就停下，方便先人工检查；`sync` 是同一条流水线对准真实 sessions 根目录：先转换到临时目录 → 校验 → 再逐个会话对齐。两者都会直接打开附件库，所以 CLI 和 `/import-codex` 一样能导入图片。
+`convert` 只写出一个目录就停下，方便先人工检查；`sync` 是同一条流水线对准真实 sessions 根目录：先转换到临时目录 → 校验 → 再逐个会话对齐。`--dry-run` 也走同一条转换和校验路径，结束后删除临时目录，不打开也不修改附件库。普通 CLI 命令会直接打开附件库，所以和 `/import-codex` 一样能导入图片。`--codex-root` 可指向归档的 Codex 导出，`--dsh-home` 选择附件库所在的 profile；显式 `--into` 或 `DSH_TUI_SESSION_ROOT` 会优先决定会话根目录。
 
 ## 重复导入是增量的
 
@@ -71,7 +81,7 @@ node bin/import-codex.mjs sync    --since-hours 24      # 直接同步进 $DSH_H
 | 内容不同 | **原地刷新** —— session id 与目录都不变，所以 `/resume` 列表和工作区状态继续有效。Codex 侧新增的轮次、以及早于某次转换器改动导入的会话，都靠这条路径补齐。 |
 | 不是本导入器写的文件 | **完全不碰**。 |
 
-最后一条最关键。DSH 是**每批事件追加一个 zstd 帧**，所以你在 DSH 里继续过的会话已经不是两帧日志了；重写它会删掉你自己的轮次。反过来，仍是两帧、但摘要与本导入器记录的不一致，说明有别的什么东西重写过它，同样不碰。`--force` 可以覆盖这个保护，它按设计就是破坏性的。若某次转换拿不到附件库（会把图片弄丢），也会被拒绝，而不会允许它覆盖一个本来就带图片的日志。
+最后一条最关键。DSH 是**每批事件追加一个 zstd 帧**，所以你在 DSH 里继续过的会话已经不是两帧日志了；重写它会删掉你自己的轮次。反过来，仍是两帧、但摘要与本导入器记录的不一致，说明有别的什么东西重写过它，同样不碰。`--force` 可以覆盖这个保护，它按设计就是破坏性的。若某次转换拿不到附件库（会把图片弄丢），也会被拒绝，而不会允许它覆盖一个本来就带图片的日志。同步会在 sessions 根目录旁维护 `codex-import-state.json`；只有实际安装或刷新会话时，才会在 `codex-import-manifests/` 保存独立的 JSON 清单。无变化重跑会保留之前的清单和撤销历史；旧版脚本需要的文本清单仍会同步生成。
 
 全程不删除任何东西，也不会把一个对话导入两次：刷新是替换文件，目录、目录里的其他文件、以及 session id 都保留。
 
@@ -79,9 +89,9 @@ node bin/import-codex.mjs sync    --since-hours 24      # 直接同步进 $DSH_H
 
 | | 结果 |
 | --- | --- |
-| 消息、工具调用与结果 | **完整导入**。若需要更小的会话，可用 `--max-tool-output N` 把每条工具输出截断到 N 字符；默认 0，即全部保留。 |
+| 消息、工具调用与结果 | **完整导入**。若需要更小的会话，可用 `--max-tool-output N` 把每条工具输出截断到 N 字符；默认 0，即全部保留。缺失的调用或结果会补成明确占位并计入报告，非零退出会保留错误标记。 |
 | 思维链 | 只有明文 `summary`，覆盖率约三分之一。其余是 OpenAI 服务端密钥的 Fernet 令牌，任何客户端都读不了。 |
-| 图片 | **会导入**，经附件库。只会如实报告，绝不静默丢弃。 |
+| 图片 | **会导入**，经附件库，兼容 App Server、telemetry 侧用户图片和结构化图片生成结果。过大的 base64 会在分配内存前拒绝；附件库实际拒绝会明确报告。 |
 | Codex 注入的上下文 | 丢弃。但 `# Files mentioned by the user:` 是**拆壳**而非丢弃 —— 它内部裹着真人的原始提问。 |
 | 压缩标记、world state、token 计数、子 agent 信封 | 丢弃：属于上下文管道，不是对话内容。只存在于压缩 `replacement_history` 里的消息会被捞回来。 |
 | Codex 工具名（`exec`、`shell` 等） | 原样保留为历史供模型阅读，但在 DSH 里不可调用。 |
@@ -106,7 +116,7 @@ DSH 会**三次**校验会话日志，而较弱的检查并不足够 —— 一�
 ## 环境要求
 
 - 已安装 `dsh-tui` profile 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-- Node.js 18+（插件运行在 harness 内）
+- Node.js 22.15+（转换器和校验器使用 Node 原生 Zstandard API）
 - Codex 数据位于 `$CODEX_HOME/sessions`（默认 `~/.codex/sessions`）
 
 ## 开发
@@ -119,10 +129,11 @@ scripts/reinstall.sh          # 重新拷贝进 dsh-tui profile，然后重启 d
 
 `scripts/reinstall.sh <profile>` 可指定其他 profile。重复执行 `dsh plugin add` 会原地刷新已有的 `file:` 依赖，不需要先 remove。
 
-测试跑在真实 Codex 语料和一次性的 `DSH_HOME` 上，不需要 mock，也不会留下残留：
+测试使用项目 `.test-work` 下生成的合成 Codex 语料和一次性的 `DSH_HOME`，不会读取你的个人历史。校验器使用下载到 `.test-runtime` 的固定版本 DSH 运行时，不会调用全局 DSH，也不会碰 `~/.dsh` 或 `~/.codex`。确定性回归套件覆盖损坏输入、zstd 魔数冲突、低内存扫描、dry-run 副作用、回滚历史和软链接防护：
 
 ```sh
-npm test              # 先测对齐行为，再测组装后的 /import-codex 命令本体
+npm run test:setup     # 每个 clone 只需执行一次：下载隔离的 DSH 测试运行时
+npm test              # 先测确定性回归，再测对齐行为和 /import-codex 命令本体
 node scripts/test-sync.mjs --keep     # 保留临时目录以便排查
 ```
 
