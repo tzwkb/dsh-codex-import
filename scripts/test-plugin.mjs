@@ -17,7 +17,7 @@
  * The test creates a fixed two-segment fixture inside the repository, so it is
  * deterministic and never scans a user's live Codex corpus.
  */
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, cpSync, mkdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import { openAttachmentStore } from '../lib/store.js'
@@ -92,6 +92,46 @@ try {
     assert.equal(dry.kind, 'success', dry.text)
     assert.match(dry.text, /Dry run/)
     assert.equal(existsSync(root), false, 'a dry run created the sessions root')
+  })
+
+  const spacedCodexRoot = join(fixture.root, 'codex root', 'sessions')
+  mkdirSync(join(fixture.root, 'codex root'), { recursive: true, mode: 0o700 })
+  cpSync(fixture.codexRoot, spacedCodexRoot, { recursive: true })
+  const quotedPath = await command.handler({
+    rawInput: `${selection} --codex-root "${spacedCodexRoot}" --dry-run`,
+  })
+  check('quoted paths remain intact in slash-command options', () => {
+    assert.equal(quotedPath.kind, 'success', quotedPath.text)
+    assert.match(quotedPath.text, /Dry run/)
+  })
+
+  const previousImportTmpRoot = process.env.DSH_CODEX_IMPORT_TMP_ROOT
+  const temporaryReal = join(fixture.root, 'temporary-root-real')
+  const temporaryLink = join(fixture.root, 'temporary-root-link')
+  mkdirSync(temporaryReal, { recursive: true, mode: 0o700 })
+  symlinkSync(temporaryReal, temporaryLink, 'dir')
+  process.env.DSH_CODEX_IMPORT_TMP_ROOT = temporaryLink
+  const blockedTemporaryRoot = await command.handler({ rawInput: `${selection} --dry-run` })
+  if (previousImportTmpRoot === undefined) delete process.env.DSH_CODEX_IMPORT_TMP_ROOT
+  else process.env.DSH_CODEX_IMPORT_TMP_ROOT = previousImportTmpRoot
+  check('a symlinked temporary root is rejected before any write', () => {
+    assert.equal(blockedTemporaryRoot.kind, 'error')
+    assert.match(blockedTemporaryRoot.text, /temporary import root|symbolic link|regular directory/i)
+    assert.deepEqual(readdirSync(temporaryReal), [])
+  })
+
+  const liveReal = join(fixture.root, 'live-root-real')
+  const liveLink = join(fixture.root, 'live-root-link')
+  mkdirSync(liveReal, { recursive: true, mode: 0o700 })
+  symlinkSync(liveReal, liveLink, 'dir')
+  process.env.DSH_TUI_SESSION_ROOT = liveLink
+  const blockedLiveRoot = await command.handler({ rawInput: selection })
+  if (previousSessionRoot === undefined) delete process.env.DSH_TUI_SESSION_ROOT
+  else process.env.DSH_TUI_SESSION_ROOT = previousSessionRoot
+  check('a symlinked sessions root is rejected before any write', () => {
+    assert.equal(blockedLiveRoot.kind, 'error')
+    assert.match(blockedLiveRoot.text, /sessions root|symbolic link|regular directory/i)
+    assert.deepEqual(readdirSync(liveReal), [])
   })
 
   console.log(`\ninstalls, then reports itself up to date`)

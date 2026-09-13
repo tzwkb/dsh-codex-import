@@ -211,10 +211,11 @@ The store accepts `image/png`, `image/jpeg`, `image/webp`, and `image/gif`.
 | `response_item` `tool_search_call` / `tool_search_output` | `tool/call` / `tool/result` (`tool_search`) |
 | `response_item` `web_search_call` | `tool/call` + generated successful placeholder result when Codex has no output record |
 | `response_item` `imageGeneration` / `image_generation_call` (including `result.b64_json`/`b64Json`) | balanced `image_generation` call/result with an attachment-store image when the payload contains a supported image |
-| `response_item` `agent_message` | dropped — inter-agent envelope, mostly encrypted |
+| `response_item` `agent_message` | readable text retained as an assistant message; encrypted-only envelopes are omitted |
 | `compacted`, `world_state`, `turn_context`, `token_usage_record`, `inter_agent_communication_metadata` | dropped — context plumbing, not transcript |
 | `event_msg` `exec_command_end` / other call completion events | correlated by `call_id`; non-zero exit, error, or failed status marks `tool/result.isError` |
-| `event_msg` `item_completed`, `token_count`, `thread_settings_applied` | dropped — context plumbing, not transcript |
+| `event_msg` `item_completed` with `UserMessage` / `AgentMessage` | crash-safe fallback message when the matching `response_item` is absent; mirrored copies are de-duplicated |
+| `event_msg` `item_completed` with other items, `token_count`, `thread_settings_applied` | dropped — context plumbing, not transcript |
 
 ## What Codex injects as the user's own words
 

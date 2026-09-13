@@ -19,7 +19,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { runImport, listConversations } from '../lib/convert.js'
 import { verifyPaths } from '../lib/verify.js'
-import { syncSessions, writeManifest, manifestPath, readState, rollbackManifest } from '../lib/sync.js'
+import { assertSafeRoot, syncSessions, writeManifest, manifestPath, readState, rollbackManifest } from '../lib/sync.js'
 import { openAttachmentStore, resolveDshHome } from '../lib/store.js'
 
 /** Keep disposable conversion trees under an explicit root when a caller needs isolation. */
@@ -262,9 +262,11 @@ async function main() {
     // `sync` converts into a scratch tree and only publishes after verification,
     // exactly as /import-codex does; nothing is written to a live root unverified.
     const temporary = command === 'sync' || opts.dryRun === true
-    mkdirSync(scratchRoot(), { recursive: true, mode: 0o700 })
+    const scratchBase = scratchRoot()
+    assertSafeRoot(scratchBase, 'temporary import root')
+    mkdirSync(scratchBase, { recursive: true, mode: 0o700 })
     const scratch = temporary
-      ? mkdtempSync(join(scratchRoot(), command === 'sync' ? 'codex-sync-' : 'codex-dry-run-'))
+      ? mkdtempSync(join(scratchBase, command === 'sync' ? 'codex-sync-' : 'codex-dry-run-'))
       : opts.out
     const target = targetSessionsRoot(opts)
     try {

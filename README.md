@@ -83,17 +83,17 @@ Importing the same conversation again is safe, and cheap when nothing changed. E
 
 The last case matters most. DSH appends one zstd frame per event batch, so a session you have continued inside DSH is no longer a two-frame log; rewriting it would delete your turns. A log at two frames whose digest does not match what the importer recorded is one something else rewrote, and is treated the same way. `--force` overrides this, and is destructive by design. A conversion that could not reach the attachment store is also refused rather than allowed to overwrite a log that holds images. A sync writes `codex-import-state.json` beside the sessions root; runs that install or refresh sessions also keep a run-specific JSON manifest under `codex-import-manifests/`. A no-op run preserves the previous manifest and its rollback history, while the text manifest remains only for older scripts.
 
-Nothing is ever deleted, and no session is ever imported twice: a refresh replaces the file, keeping the directory, any sibling files, and the session id.
+An import run never deletes a session or imports one twice: a refresh replaces the file, keeping the directory, any sibling files, and the session id. The explicit rollback command is the one operation that removes a session created by that import.
 
 ## What survives, and what does not
 
 | | Result |
 | --- | --- |
-| Messages, tool calls and results | Imported in full. `--max-tool-output N` truncates each tool output to N chars if you need smaller sessions; the default is 0, which keeps everything. Missing calls/results are repaired with explicit placeholders and counted; non-zero exits remain marked as errors. |
+| Messages, tool calls and results | Imported in full, including readable `item_completed` telemetry messages when a normal item is missing. `--max-tool-output N` truncates each tool output to N chars if you need smaller sessions; the default is 0, which keeps everything. Missing calls/results are repaired with explicit placeholders and counted; non-zero exits remain marked as errors. |
 | Reasoning | Only the plaintext `summary`, for roughly a third of records. The rest is a Fernet token keyed by OpenAI and cannot be read by any client. |
-| Images | Imported through the attachment store, including App Server and telemetry-side user images plus structured image-generation results. Oversized inline base64 is rejected before allocation; valid image-store refusals are reported. |
+| Images | Imported through the attachment store, including App Server and telemetry-side user images plus structured image-generation results. Oversized or malformed inline base64 is rejected before allocation; valid image-store refusals are reported, and the transcript keeps an omission placeholder. |
 | Codex-injected context | Dropped. The `# Files mentioned by the user:` envelope is unwrapped rather than dropped, because it wraps the human's actual prompt. |
-| Compaction markers, world state, token counts, inter-agent envelopes | Dropped: context plumbing rather than conversation. Messages that survive *only* inside a compaction's `replacement_history` are recovered. |
+| Compaction markers, world state, token counts, inter-agent envelopes | Dropped: context plumbing rather than conversation. Readable legacy `agent_message` text and messages that survive *only* inside a compaction's `replacement_history` are recovered. |
 | Codex tool names (`exec`, `shell`, …) | Preserved verbatim as history the model can read; they are not callable in DSH. |
 
 An imported image is only *visible* again if the active model accepts images. A
@@ -138,7 +138,7 @@ Tests use a synthetic Codex corpus and a throwaway `DSH_HOME` under `.test-work`
 
 ```sh
 npm run test:setup     # once per clone: download the isolated DSH test runtime
-npm test              # deterministic regressions, reconcile behaviour, then /import-codex
+npm test              # regressions, reconcile behaviour, slash command, and ACP resume smoke tests
 node scripts/test-sync.mjs --keep     # leave the scratch tree for inspection
 ```
 

@@ -54,10 +54,11 @@
   },
   "scripts": {
     "test:setup": "npm install --prefix .test-runtime --no-save --package-lock=false --ignore-scripts --cache .test-runtime/npm-cache @deepseek-ai/dsh@0.1.5-rc.1",
-    "test": "node scripts/test-regressions.mjs && node scripts/test-sync.mjs && node scripts/test-plugin.mjs",
+    "test": "node scripts/test-regressions.mjs && node scripts/test-sync.mjs && node scripts/test-plugin.mjs && node scripts/test-acp.mjs",
     "test:regressions": "node scripts/test-regressions.mjs",
     "test:sync": "node scripts/test-sync.mjs",
     "test:plugin": "node scripts/test-plugin.mjs",
+    "test:acp": "node scripts/test-acp.mjs",
     "list": "node bin/import-codex.mjs list"
   }
 }

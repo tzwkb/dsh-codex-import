@@ -11,19 +11,22 @@ import {
   cpSync, statSync, existsSync, readdirSync, symlinkSync,
 } from 'node:fs'
 import { join, relative } from 'node:path'
+import { tmpdir } from 'node:os'
 import { zstdCompressSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import {
   collectConversationRefs, iterateConversations, listConversations, collectImages,
-  findRollouts, runImport, buildRecords, sessionBody, serializeSession, encodeSegment, projectKey,
+  findRollouts, runImport, buildRecords, sessionBody, serializeSession, bodySha256,
+  sessionDirFor, encodeSegment, projectKey,
 } from '../lib/convert.js'
-import { syncSessions, writeManifest, rollbackManifest, legacyManifestPath, rollbackResultPath } from '../lib/sync.js'
-import { readSessionLog, decodeFrames, verifyPaths, findLogs } from '../lib/verify.js'
+import { assertSafeRoot, syncSessions, writeManifest, rollbackManifest, legacyManifestPath, rollbackResultPath } from '../lib/sync.js'
+import { readSessionLog, decodeFrames, verifyPaths, findLogs, assertToolCallPairing } from '../lib/verify.js'
 import { sessionsRoot, groupIntoWorkspaces } from '../lib/index.js'
-import { customToolArguments } from '../lib/codex-payload.js'
+import { customToolArguments, outputIsError, outputText } from '../lib/codex-payload.js'
 import { decodeDataUrl, generatedImageOf, MAX_IMAGE_BYTES } from '../lib/codex-images.js'
-import { isSubagentMetadata } from '../lib/codex-discovery.js'
+import { itemFailed, userText } from '../lib/codex-message.js'
+import { isSubagentMetadata, projectMatches, readRecords } from '../lib/codex-discovery.js'
 import { makeTestRoot, cleanTestRoot } from './test-env.mjs'
 
 const root = makeTestRoot('codex-regression')
@@ -84,6 +87,18 @@ const telemetryUserId = '01999999-aaaa-7bbb-8ccc-000000000022'
 const duplicateUserId = '01999999-aaaa-7bbb-8ccc-000000000023'
 const lifecycleId = '01999999-aaaa-7bbb-8ccc-000000000025'
 const searchPlaceholderId = '01999999-aaaa-7bbb-8ccc-000000000026'
+const nullMetadataId = '01999999-aaaa-7bbb-8ccc-000000000027'
+const telemetryImageOnlyId = '01999999-aaaa-7bbb-8ccc-000000000028'
+const nestedTelemetryUserId = '01999999-aaaa-7bbb-8ccc-000000000029'
+const compactionId = '01999999-aaaa-7bbb-8ccc-000000000030'
+const repeatedPromptId = '01999999-aaaa-7bbb-8ccc-000000000031'
+const aliasSchemaId = '01999999-aaaa-7bbb-8ccc-000000000032'
+const splitCompressedId = '01999999-aaaa-7bbb-8ccc-000000000033'
+const assistantTelemetryId = '01999999-aaaa-7bbb-8ccc-000000000034'
+const duplicateCallId = '01999999-aaaa-7bbb-8ccc-000000000035'
+const splitInstalledId = '01999999-aaaa-7bbb-8ccc-000000000036'
+const duplicateEventCallId = '01999999-aaaa-7bbb-8ccc-000000000038'
+const repeatedHistoryId = '01999999-aaaa-7bbb-8ccc-000000000039'
 const onePixelPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
 writeRollout(fileFor(idA), idA, 'first prompt')
 writeRollout(fileFor(idB), idB, 'second prompt')
@@ -304,18 +319,57 @@ const compressedSource = [
 const compressedPath = oldFileFor('compressed') + '.zst'
 writeFileSync(compressedPath, zstdCompressSync(Buffer.from(compressedSource, 'utf8')))
 
+// A source compressor may rotate frames in the middle of a JSON line. The
+// discovery reader must carry its UTF-8/line buffer across those boundaries.
+const splitCompressedSource = [
+  record(splitCompressedId, 0, 'session_meta', {
+    id: splitCompressedId, cwd: '/tmp/split-compressed-project', model_provider: 'openai', model: 'codex',
+    timestamp: now.toISOString(),
+  }),
+  record(splitCompressedId, 1, 'event_msg', { type: 'task_started' }),
+  record(splitCompressedId, 2, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'split frame prompt 分片' }],
+  }),
+  record(splitCompressedId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'split frame answer' }],
+  }),
+  record(splitCompressedId, 4, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n'
+const splitBytes = Buffer.from(splitCompressedSource, 'utf8')
+// Deliberately cut inside the three-byte UTF-8 encoding of `片`, not merely at
+// a JavaScript character boundary. This catches frame readers that decode each
+// compressed member independently and silently replace the split code point.
+const splitMarker = Buffer.from('片', 'utf8')
+const splitAt = splitBytes.indexOf(splitMarker) + 1
+const splitCompressedPath = oldFileFor('split-compressed') + '.zst'
+writeFileSync(splitCompressedPath, Buffer.concat([
+  zstdCompressSync(splitBytes.subarray(0, splitAt)),
+  zstdCompressSync(splitBytes.subarray(splitAt)),
+]))
+const brokenCompressedPath = oldFileFor('broken-compressed') + '.zst'
+writeFileSync(brokenCompressedPath, Buffer.concat([
+  zstdCompressSync(Buffer.from(splitCompressedSource, 'utf8')),
+  Buffer.from('not-a-zstd-frame'),
+]))
+
 const eventUserRollout = (id, name, includeResponse) => {
+  const turnId = `${id}-turn`
   const lines = [
     record(id, 0, 'session_meta', {
       id, cwd: `/tmp/${name}-project`, model_provider: 'openai', model: 'codex',
       timestamp: now.toISOString(),
     }),
     record(id, 1, 'event_msg', { type: 'task_started' }),
-    record(id, 2, 'event_msg', { type: 'user_message', message: 'telemetry-only user prompt' }),
+    record(id, 2, 'event_msg', {
+      type: 'user_message', id: `${id}-telemetry-message`, turn_id: turnId,
+      message: 'telemetry-only user prompt',
+    }),
   ]
   if (includeResponse) {
     lines.push(record(id, 3, 'response_item', {
-      type: 'message', role: 'user', content: [{ type: 'input_text', text: 'telemetry-only user prompt' }],
+      type: 'message', id: `${id}-response-message`, role: 'user',
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      content: [{ type: 'input_text', text: 'telemetry-only user prompt' }],
     }))
   }
   lines.push(record(id, includeResponse ? 4 : 3, 'response_item', {
@@ -326,6 +380,161 @@ const eventUserRollout = (id, name, includeResponse) => {
 }
 writeFileSync(oldFileFor('telemetry-user'), eventUserRollout(telemetryUserId, 'telemetry-user', false))
 writeFileSync(oldFileFor('duplicate-user'), eventUserRollout(duplicateUserId, 'duplicate-user', true))
+writeFileSync(oldFileFor('null-metadata'), [
+  record(nullMetadataId, 0, 'session_meta', {
+    id: nullMetadataId, cwd: '/tmp/null-metadata-project', model_provider: 'openai',
+    timestamp: now.toISOString(),
+  }),
+  record(nullMetadataId, 1, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'null metadata prompt' }],
+  }),
+  record(nullMetadataId, 2, 'session_meta', null),
+  record(nullMetadataId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'null metadata answer' }],
+  }),
+  record(nullMetadataId, 4, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+writeFileSync(oldFileFor('telemetry-image-only'), [
+  record(telemetryImageOnlyId, 0, 'session_meta', {
+    id: telemetryImageOnlyId, cwd: '/tmp/telemetry-image-project', model_provider: 'openai',
+    timestamp: now.toISOString(),
+  }),
+  record(telemetryImageOnlyId, 1, 'event_msg', { type: 'task_started' }),
+  record(telemetryImageOnlyId, 2, 'event_msg', {
+    type: 'user_message',
+    message: { content: [{ type: 'input_image', image_url: 'data:image/png;base64,' + onePixelPng }] },
+  }),
+  record(telemetryImageOnlyId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'image received' }],
+  }),
+  record(telemetryImageOnlyId, 4, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+writeFileSync(oldFileFor('nested-telemetry-user'), [
+  record(nestedTelemetryUserId, 0, 'session_meta', {
+    id: nestedTelemetryUserId, cwd: '/tmp/nested-telemetry-project', model_provider: 'openai',
+    timestamp: now.toISOString(),
+  }),
+  record(nestedTelemetryUserId, 1, 'event_msg', { type: 'task_started' }),
+  record(nestedTelemetryUserId, 2, 'event_msg', {
+    type: 'item_completed',
+    item: {
+      type: 'UserMessage',
+      id: 'nested-telemetry-user-message',
+      content: [
+        { type: 'input_text', text: 'nested telemetry prompt' },
+        { type: 'input_image', image_url: 'data:image/png;base64,' + onePixelPng },
+      ],
+    },
+  }),
+  record(nestedTelemetryUserId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'nested telemetry answer' }],
+  }),
+  record(nestedTelemetryUserId, 4, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+writeFileSync(oldFileFor('compaction-history'), [
+  record(compactionId, 0, 'session_meta', {
+    id: compactionId, cwd: '/tmp/compaction-project', model_provider: 'openai', model: 'codex',
+    timestamp: now.toISOString(),
+  }),
+  record(compactionId, 1, 'event_msg', { type: 'task_started' }),
+  record(compactionId, 2, 'compacted', {
+    replacement_history: [
+      { type: 'message', id: 'history-user-1', role: 'user', content: [{ type: 'input_text', text: 'recovered compaction prompt' }] },
+      { type: 'message', id: 'history-assistant-1', role: 'assistant', content: [{ type: 'output_text', text: 'recovered compaction answer' }] },
+      { type: 'message', id: 'normal-user-1', role: 'user', content: [{ type: 'input_text', text: 'normal compaction prompt' }] },
+      { type: 'compaction' },
+    ],
+  }),
+  record(compactionId, 3, 'response_item', {
+    type: 'message', id: 'normal-user-1', role: 'user',
+    content: [{ type: 'input_text', text: 'normal compaction prompt' }],
+  }),
+  record(compactionId, 4, 'response_item', {
+    type: 'message', id: 'normal-assistant-1', role: 'assistant',
+    content: [{ type: 'output_text', text: 'normal compaction answer' }],
+  }),
+  record(compactionId, 5, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+
+// The same human text can legitimately occur in separate turns. A telemetry
+// fallback must only mirror its matching turn, rather than being dropped by a
+// corpus-wide body-text set.
+writeFileSync(oldFileFor('repeated-prompt'), [
+  record(repeatedPromptId, 0, 'session_meta', {
+    id: repeatedPromptId, cwd: '/tmp/repeated-prompt-project', model_provider: 'openai', model: 'codex',
+    timestamp: now.toISOString(),
+  }),
+  record(repeatedPromptId, 1, 'event_msg', { type: 'task_started', turn_id: 'repeat-turn-a' }),
+  record(repeatedPromptId, 2, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'repeat me' }],
+    internal_chat_message_metadata_passthrough: { turn_id: 'repeat-turn-a' },
+  }),
+  record(repeatedPromptId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first answer' }],
+  }),
+  record(repeatedPromptId, 4, 'event_msg', { type: 'task_complete', turn_id: 'repeat-turn-a' }),
+  record(repeatedPromptId, 5, 'event_msg', { type: 'task_started', turn_id: 'repeat-turn-b' }),
+  record(repeatedPromptId, 6, 'event_msg', {
+    type: 'user_message', turn_id: 'repeat-turn-b', message: 'repeat me',
+  }),
+  record(repeatedPromptId, 7, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'second answer' }],
+  }),
+  record(repeatedPromptId, 8, 'event_msg', { type: 'task_complete', turn_id: 'repeat-turn-b' }),
+].join('\n') + '\n')
+
+// Exercise case, separator, and camelCase aliases together with the alternate
+// compaction property spelling used by App Server exports.
+writeFileSync(oldFileFor('alias-schema'), [
+  record(aliasSchemaId, 0, 'session_meta', {
+    id: aliasSchemaId, cwd: '/tmp/alias-schema-project', model_provider: 'openai', model: 'codex',
+    timestamp: now.toISOString(),
+  }),
+  record(aliasSchemaId, 1, 'event_msg', { type: 'TASK_STARTED' }),
+  record(aliasSchemaId, 2, 'response_item', {
+    type: 'USER_MESSAGE', id: 'alias-user-1', text: 'uppercase user message',
+  }),
+  record(aliasSchemaId, 3, 'response_item', {
+    type: 'COMMAND-EXECUTION', id: 'alias-command-1', command: 'echo alias',
+    status: 'COMPLETED', aggregatedOutput: 'alias command output', exitCode: 0,
+  }),
+  record(aliasSchemaId, 4, 'response_item', {
+    type: 'AGENTMESSAGE', id: 'alias-agent-1', text: 'uppercase agent answer',
+  }),
+  record(aliasSchemaId, 5, 'compacted', {
+    replacementHistory: [
+      { type: 'UserMessage', id: 'alias-history-user', text: 'uppercase history prompt' },
+      { type: 'AgentMessage', id: 'alias-history-agent', text: 'uppercase history answer' },
+    ],
+  }),
+  record(aliasSchemaId, 6, 'event_msg', { type: 'TASK_COMPLETE' }),
+].join('\n') + '\n')
+
+// Newer Codex builds persist assistant messages in `event_msg.item_completed`
+// even when the corresponding response_item was never flushed. Keep a
+// telemetry-only fixture (plus a repeated mirror) so an interrupted tail is
+// recovered once, without inventing a second assistant message.
+writeFileSync(oldFileFor('assistant-telemetry'), [
+  record(assistantTelemetryId, 0, 'session_meta', {
+    id: assistantTelemetryId, cwd: '/tmp/assistant-telemetry-project', model_provider: 'openai', model: 'codex',
+    timestamp: now.toISOString(),
+  }),
+  record(assistantTelemetryId, 1, 'event_msg', { type: 'task_started', turn_id: 'assistant-telemetry-turn' }),
+  record(assistantTelemetryId, 2, 'event_msg', {
+    type: 'item_completed', turn_id: 'assistant-telemetry-turn', item: {
+      type: 'AgentMessage', id: 'assistant-telemetry-message', phase: 'final_answer',
+      content: [{ type: 'Text', text: 'assistant recovered from telemetry' }],
+    },
+  }),
+  record(assistantTelemetryId, 3, 'event_msg', {
+    type: 'item_completed', turn_id: 'assistant-telemetry-turn', item: {
+      type: 'AgentMessage', id: 'assistant-telemetry-message', phase: 'final_answer',
+      content: [{ type: 'Text', text: 'assistant recovered from telemetry' }],
+    },
+  }),
+  record(assistantTelemetryId, 4, 'event_msg', { type: 'task_complete', turn_id: 'assistant-telemetry-turn' }),
+].join('\n') + '\n')
+
 writeFileSync(oldFileFor('lifecycle-aliases'), [
   record(lifecycleId, 0, 'session_meta', {
     id: lifecycleId, cwd: '/tmp/lifecycle-project', model_provider: 'openai', model: 'codex',
@@ -364,6 +573,77 @@ writeFileSync(oldFileFor('search-placeholders'), [
     type: 'tool_search_call', call_id: 'tool-no-output', arguments: { query: 'lookup' },
   }),
   record(searchPlaceholderId, 5, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+
+// Malformed exports have occasionally reused a raw call id. The importer must
+// preserve both exchanges while assigning DSH-safe, unique ids.
+writeFileSync(oldFileFor('duplicate-call-ids'), [
+  record(duplicateCallId, 0, 'session_meta', {
+    id: duplicateCallId, cwd: '/tmp/duplicate-call-project', model_provider: 'openai', model: 'codex',
+    timestamp: now.toISOString(),
+  }),
+  record(duplicateCallId, 1, 'event_msg', { type: 'task_started' }),
+  record(duplicateCallId, 2, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'duplicate calls' }],
+  }),
+  record(duplicateCallId, 3, 'response_item', {
+    type: 'function_call', call_id: 'same-raw-id', name: 'first_tool', arguments: '{}',
+  }),
+  record(duplicateCallId, 4, 'response_item', {
+    type: 'function_call', call_id: 'same-raw-id', name: 'second_tool', arguments: '{}',
+  }),
+  record(duplicateCallId, 5, 'response_item', {
+    type: 'function_call_output', call_id: 'same-raw-id', output: 'first result',
+  }),
+  record(duplicateCallId, 6, 'response_item', {
+    type: 'function_call_output', call_id: 'same-raw-id', output: 'second result',
+  }),
+  record(duplicateCallId, 7, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+
+// Completion telemetry can repeat the same malformed raw id too. Keep the
+// ordered event outcomes paired with the renamed calls rather than assigning
+// the last completion to the first call and fabricating an error for the next.
+writeFileSync(oldFileFor('duplicate-event-call-ids'), [
+  record(duplicateEventCallId, 0, 'session_meta', {
+    id: duplicateEventCallId, cwd: '/tmp/duplicate-event-call-project', model_provider: 'openai',
+    timestamp: now.toISOString(),
+  }),
+  record(duplicateEventCallId, 1, 'event_msg', { type: 'task_started' }),
+  record(duplicateEventCallId, 2, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'duplicate event calls' }],
+  }),
+  record(duplicateEventCallId, 3, 'response_item', {
+    type: 'function_call', call_id: 'same-event-raw-id', name: 'first_tool', arguments: '{}',
+  }),
+  record(duplicateEventCallId, 4, 'response_item', {
+    type: 'function_call', call_id: 'same-event-raw-id', name: 'second_tool', arguments: '{}',
+  }),
+  record(duplicateEventCallId, 5, 'event_msg', {
+    type: 'exec_command_end', call_id: 'same-event-raw-id', output: 'first event result',
+  }),
+  record(duplicateEventCallId, 6, 'event_msg', {
+    type: 'exec_command_end', call_id: 'same-event-raw-id', output: 'second event result',
+  }),
+  record(duplicateEventCallId, 7, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+
+// A compaction snapshot can contain two legitimate id-less messages with the
+// same body. Repeated snapshots should fold as snapshots, while multiplicity
+// inside one snapshot must remain visible in both conversion and listing.
+const repeatedHistory = [
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'same history prompt' }] },
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'same history prompt' }] },
+  { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'same history answer' }] },
+]
+writeFileSync(oldFileFor('repeated-history'), [
+  record(repeatedHistoryId, 0, 'session_meta', {
+    id: repeatedHistoryId, cwd: '/tmp/repeated-history-project', model_provider: 'openai',
+    timestamp: now.toISOString(),
+  }),
+  record(repeatedHistoryId, 1, 'compacted', { replacement_history: repeatedHistory }),
+  record(repeatedHistoryId, 2, 'compacted', { replacement_history: repeatedHistory }),
+  record(repeatedHistoryId, 3, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 let passed = 0
@@ -405,6 +685,30 @@ try {
     assert.ok(events.some((event) => JSON.stringify(event).includes('compressed rollout answer')))
   })
 
+  await check('source zstd frames are streamed across concatenated boundaries', async () => {
+    const files = findRollouts(Number.MAX_SAFE_INTEGER, codexRoot)
+      .filter((file) => file.path === splitCompressedPath)
+    assert.equal(files.length, 1)
+    const records = readRecords(splitCompressedPath)
+    assert.equal(records.length, 5)
+    assert.equal(records[2].payload.content[0].text, 'split frame prompt 分片')
+    const out = join(root, 'scratch-split-compressed')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [splitCompressedId] })
+    assert.equal(imported.results.length, 1)
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    assert.ok(events.some((event) => JSON.stringify(event).includes('split frame answer')))
+  })
+
+  await check('a truncated or appended bad zstd frame is ignored atomically', () => {
+    assert.deepEqual(readRecords(brokenCompressedPath), [])
+    assert.throws(() => decodeFrames(readFileSync(brokenCompressedPath)), /frame boundary|invalid zstd/i)
+  })
+
+  await check('a rollout removed during discovery is treated as an empty stream', () => {
+    assert.deepEqual(readRecords(join(codexRoot, 'does-not-exist.jsonl')), [])
+  })
+
   await check('event_msg user_message is recovered only when response_item is absent', async () => {
     const out = join(root, 'scratch-event-user')
     const imported = await runImport({ root: out, codexRoot, sessionIds: [telemetryUserId, duplicateUserId] })
@@ -419,6 +723,59 @@ try {
     const listed = listConversations({ sinceHours: Number.MAX_SAFE_INTEGER, codexRoot })
     const telemetryRow = listed.rows.find((row) => row.sessionId === telemetryUserId)
     assert.equal(telemetryRow?.prompt, 'telemetry-only user prompt')
+  })
+
+  await check('repeated prompts remain distinct across normal and telemetry turns', async () => {
+    const out = join(root, 'scratch-repeated-prompt')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [repeatedPromptId] })
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const users = events.filter((event) => event.type === 'user/message')
+    assert.equal(users.length, 2)
+    const listed = listConversations({ sinceHours: Number.MAX_SAFE_INTEGER, codexRoot })
+    const row = listed.rows.find((entry) => entry.sessionId === repeatedPromptId)
+    assert.equal(row?.prompts, 2)
+  })
+
+  await check('id-less repeated prompts at different positions are never folded', () => {
+    const ts = now.toISOString()
+    const message = (ordinal, text) => ({
+      type: 'response_item', timestamp: ts, ordinal,
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+    })
+    const built = buildRecords([
+      { records: [
+        { type: 'session_meta', timestamp: ts, ordinal: 0, payload: { id: 'idless-repeat', cwd: '/tmp/idless-repeat' } },
+        message(1, 'same body'),
+      ] },
+      { records: [
+        { type: 'session_meta', timestamp: new Date(now.getTime() + 1000).toISOString(), ordinal: 0, payload: { id: 'idless-repeat', cwd: '/tmp/idless-repeat' } },
+        message(2, 'same body'),
+      ] },
+    ], 'idless-repeat')
+    assert.equal(built.records.filter((event) => event.type === 'user/message').length, 2)
+  })
+
+  await check('reused message ids cannot erase changed content or another role', () => {
+    const ts = now.toISOString()
+    const source = (ordinal, role, text) => ({
+      type: 'response_item', timestamp: ts, ordinal,
+      payload: { type: 'message', id: 'reused-message', role, content: [
+        { type: role === 'assistant' ? 'output_text' : 'input_text', text },
+      ] },
+    })
+    const built = buildRecords([{ records: [
+      { type: 'session_meta', timestamp: ts, ordinal: 0, payload: { id: 'reused-session', cwd: '/tmp/reused' } },
+      source(1, 'user', 'first user body'),
+      source(2, 'user', 'updated user body'),
+      source(3, 'assistant', 'assistant body'),
+    ] }], 'reused-session')
+    const messages = built.records.filter((event) => event.type === 'user/message' || event.type === 'assistant/message')
+    assert.equal(messages.length, 3)
+    assert.ok(messages.some((event) => JSON.stringify(event).includes('first user body')))
+    assert.ok(messages.some((event) => JSON.stringify(event).includes('updated user body')))
+    assert.ok(messages.some((event) => JSON.stringify(event).includes('assistant body')))
+    assert.equal(new Set(messages.map((event) => event.data.message?.id ?? event.data.id)).size, 3)
   })
 
   await check('current payload.id lineage is grouped by its root and duplicate messages fold once', async () => {
@@ -512,6 +869,44 @@ try {
     assert.equal(rejected, undefined)
   })
 
+  await check('image decoding rejects malformed base64 but accepts wrapped valid data', () => {
+    assert.equal(decodeDataUrl('data:image/png;base64,not@@base64'), undefined)
+    assert.equal(decodeDataUrl('data:image/png;base64,abcd='), undefined)
+    assert.equal(decodeDataUrl('data:image/png;base64, aW1h\nZ2U=')?.bytes.toString(), 'image')
+    assert.equal(decodeDataUrl('data:IMAGE/PNG;charset=UTF-8;BASE64, aW1hZ2U=')?.mediaType, 'image/png')
+    assert.equal(decodeDataUrl('data:text/plain;base64,aW1hZ2U='), undefined)
+  })
+
+  await check('malformed image-only prompts remain visible with an explicit placeholder', () => {
+    const ts = now.toISOString()
+    const built = buildRecords([{ records: [
+      { type: 'session_meta', timestamp: ts, ordinal: 0, payload: { id: 'bad-image', cwd: '/tmp/bad-image' } },
+      { type: 'response_item', timestamp: ts, ordinal: 1, payload: {
+        type: 'message', role: 'user', content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,not@@base64' },
+        ],
+      } },
+    ] }], 'bad-image')
+    const user = built.records.find((event) => event.type === 'user/message')
+    assert.ok(user)
+    assert.match(user.data.content[0].text, /image omitted.*invalid/i)
+    assert.equal(built.stats.imagesSkipped, 1)
+  })
+
+  await check('in-progress tool statuses are not misreported as failures', () => {
+    assert.equal(itemFailed({ status: 'in_progress' }), false)
+    assert.equal(itemFailed({ status: 'in-progress' }), false)
+    assert.equal(itemFailed({ status: 'running' }), false)
+    assert.equal(itemFailed({ status: 'failed' }), true)
+  })
+
+  await check('failure status aliases are normalized consistently', () => {
+    assert.equal(itemFailed({ status: 'timed-out' }), true)
+    assert.equal(itemFailed({ status: 'TIME OUT' }), true)
+    assert.equal(outputIsError({ status: 'timed-out' }), true)
+    assert.equal(outputIsError({ result: { status: 'in progress' } }), false)
+  })
+
   await check('image generation accepts structured b64_json results', () => {
     const image = generatedImageOf({ result: { b64_json: onePixelPng } })
     assert.equal(image?.mediaType, 'image/png')
@@ -532,6 +927,87 @@ try {
       },
     }] }] }
     assert.equal(collectImages([convo]).size, 1)
+  })
+
+  await check('image-only telemetry prompts survive fallback recovery', async () => {
+    const out = join(root, 'scratch-telemetry-image-only')
+    const imported = await runImport({
+      root: out, codexRoot, sessionIds: [telemetryImageOnlyId],
+      saveImages: async (inputs) => inputs.map(() => ({
+        attachmentId: 'sha256:telemetry-image-only', mediaType: 'image/png', width: 1, height: 1, bytes: 68,
+      })),
+    })
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const users = events.filter((event) => event.type === 'user/message')
+    assert.equal(users.length, 1)
+    assert.ok(users[0].data.content.some((block) => block.type === 'image'))
+    const listed = listConversations({ sinceHours: Number.MAX_SAFE_INTEGER, codexRoot })
+    const row = listed.rows.find((entry) => entry.sessionId === telemetryImageOnlyId)
+    assert.equal(row?.prompt, '[image]')
+    assert.equal(row?.prompts, 1)
+  })
+
+  await check('image-only prompts stay visible when the attachment store is unavailable', async () => {
+    const out = join(root, 'scratch-telemetry-image-no-store')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [telemetryImageOnlyId] })
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const user = events.find((event) => event.type === 'user/message')
+    assert.ok(user)
+    assert.match(user.data.content[0].text, /image omitted.*sha256:/i)
+    assert.equal(imported.results[0].stats.imagesSkipped, 1)
+  })
+
+  await check('nested item_completed user prompts survive fallback recovery', async () => {
+    const out = join(root, 'scratch-nested-telemetry-user')
+    const imported = await runImport({
+      root: out, codexRoot, sessionIds: [nestedTelemetryUserId],
+      saveImages: async (inputs) => inputs.map(() => ({
+        attachmentId: 'sha256:nested-telemetry-user', mediaType: 'image/png', width: 1, height: 1, bytes: 68,
+      })),
+    })
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const users = events.filter((event) => event.type === 'user/message')
+    assert.equal(users.length, 1)
+    assert.match(JSON.stringify(users[0]), /nested telemetry prompt/)
+    assert.ok(users[0].data.content.some((block) => block.type === 'image'))
+  })
+
+  await check('nested item_completed assistant messages recover once and mirror normal items', async () => {
+    const out = join(root, 'scratch-assistant-telemetry')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [assistantTelemetryId] })
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const assistants = events.filter((event) => event.type === 'assistant/message')
+    assert.equal(assistants.length, 1)
+    assert.match(JSON.stringify(assistants[0]), /assistant recovered from telemetry/)
+
+    const ts = now.toISOString()
+    const normal = {
+      type: 'response_item', timestamp: ts, ordinal: 3,
+      payload: {
+        type: 'message', id: 'mirrored-assistant', role: 'assistant',
+        content: [{ type: 'output_text', text: 'mirrored assistant' }],
+        turn_id: 'mirrored-turn',
+      },
+    }
+    const mirror = {
+      type: 'event_msg', timestamp: ts, ordinal: 2,
+      payload: {
+        type: 'item_completed', turn_id: 'mirrored-turn', item: {
+          type: 'AgentMessage', id: 'mirrored-assistant',
+          content: [{ type: 'Text', text: 'mirrored assistant' }],
+        },
+      },
+    }
+    const built = buildRecords([{ records: [
+      { type: 'session_meta', timestamp: ts, ordinal: 0, payload: { id: 'mirrored-session', cwd: '/tmp/mirrored' } },
+      { type: 'event_msg', timestamp: ts, ordinal: 1, payload: { type: 'task_started', turn_id: 'mirrored-turn' } },
+      mirror, normal,
+    ] }], 'mirrored-session')
+    assert.equal(built.records.filter((event) => event.type === 'assistant/message').length, 1)
   })
 
   await check('camelCase App Server items, inline tool blocks, and explicit titles survive', async () => {
@@ -563,8 +1039,55 @@ try {
     const title = events.find((event) => event.type === 'session/title')
     assert.equal(title.data.title, 'Rich schema title')
     assert.equal(title.data.source.kind, 'user')
+    const listed = listConversations({
+      sinceHours: Number.MAX_SAFE_INTEGER, codexRoot, project: '/tmp/rich-project',
+    })
+    const row = listed.rows.find((entry) => entry.sessionId === richSchemaId)
+    assert.equal(row?.prompt, 'rich schema prompt')
+    assert.equal(row?.prompts, 1)
     const verified = await verifyPaths([out], { quiet: true })
     assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
+  await check('case and separator aliases plus replacementHistory remain importable', async () => {
+    const out = join(root, 'scratch-alias-schema')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [aliasSchemaId] })
+    assert.equal(imported.results.length, 1)
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    assert.ok(events.some((event) => JSON.stringify(event).includes('uppercase user message')))
+    assert.ok(events.some((event) => JSON.stringify(event).includes('uppercase agent answer')))
+    assert.ok(events.some((event) => JSON.stringify(event).includes('alias command output')))
+    assert.ok(events.some((event) => JSON.stringify(event).includes('uppercase history prompt')))
+    const verified = await verifyPaths([out], { quiet: true })
+    assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
+  await check('listing counts prompts recovered from compaction history', async () => {
+    const out = join(root, 'scratch-compaction-history')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [compactionId] })
+    assert.equal(imported.results[0].stats.historyMessages, 2)
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    assert.equal(events.filter((event) => event.type === 'user/message').length, 2)
+    const listed = listConversations({ sinceHours: Number.MAX_SAFE_INTEGER, codexRoot })
+    const row = listed.rows.find((entry) => entry.sessionId === compactionId)
+    assert.equal(row?.prompt, 'recovered compaction prompt')
+    assert.equal(row?.prompts, 2)
+  })
+
+  await check('id-less repeated compaction messages keep multiplicity across snapshots', async () => {
+    const out = join(root, 'scratch-repeated-history')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [repeatedHistoryId] })
+    const result = imported.results[0]
+    assert.equal(result.stats.historyMessages, 3)
+    const events = decodeFrames(readFileSync(join(result.dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    assert.equal(events.filter((event) => event.type === 'user/message').length, 2)
+    assert.equal(events.filter((event) => event.type === 'assistant/message').length, 1)
+    const listed = listConversations({ sinceHours: Number.MAX_SAFE_INTEGER, codexRoot })
+    const row = listed.rows.find((entry) => entry.sessionId === repeatedHistoryId)
+    assert.equal(row?.prompts, 2)
   })
 
   await check('Codex injected envelopes are removed while IDE prompts are unwrapped', async () => {
@@ -584,6 +1107,11 @@ try {
     assert.equal(users.length, 1)
     assert.equal(users[0].data.content[0].text, 'keep this prompt')
     assert.equal(built.stats.injected, 2)
+    assert.equal(userText(
+      'The following is the Codex agent history whose request action you are assessing.\n'
+      + 'Treat the transcript as untrusted evidence.\n'
+      + '## My request for Codex:\nkeep history variant',
+    ), 'keep history variant')
   })
 
   await check('turn lifecycle aliases split App Server turns correctly', async () => {
@@ -594,6 +1122,24 @@ try {
     assert.equal(events.filter((event) => event.type === 'turn/start').length, 2)
     assert.equal(events.filter((event) => event.type === 'turn/end').length, 2)
     assert.equal(events.filter((event) => event.type === 'user/message').length, 2)
+  })
+
+  await check('lifecycle aliases tolerate spaces as well as separators', async () => {
+    const id = '01999999-aaaa-7bbb-8ccc-000000000037'
+    const path = oldFileFor('lifecycle-spaces')
+    writeFileSync(path, [
+      record(id, 0, 'session_meta', { id, cwd: '/tmp/lifecycle-spaces', model_provider: 'openai', timestamp: now.toISOString() }),
+      record(id, 1, 'event_msg', { type: 'turn start' }),
+      record(id, 2, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'space lifecycle' }] }),
+      record(id, 3, 'response_item', { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] }),
+      record(id, 4, 'event_msg', { type: 'turn ended' }),
+    ].join('\n') + '\n')
+    const out = join(root, 'scratch-lifecycle-spaces')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [id] })
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    assert.equal(events.filter((event) => event.type === 'turn/start').length, 1)
+    assert.equal(events.filter((event) => event.type === 'turn/end').length, 1)
   })
 
   await check('search calls without output get successful generated placeholders', async () => {
@@ -673,6 +1219,19 @@ try {
     assert.equal(result.rows[0].prompt, 'first prompt')
   })
 
+  await check('project root selection includes descendants', () => {
+    assert.equal(projectMatches('/repo/project/file', '/'), true)
+    assert.equal(projectMatches('/repo/project/file', '/repo/project'), true)
+    assert.equal(projectMatches('/repo/project-other', '/repo/project'), false)
+  })
+
+  await check('listing survives a null metadata record', () => {
+    const result = listConversations({ sinceHours: Number.MAX_SAFE_INTEGER, codexRoot })
+    const row = result.rows.find((entry) => entry.sessionId === nullMetadataId)
+    assert.equal(row?.cwd, '/tmp/null-metadata-project')
+    assert.equal(row?.prompt, 'null metadata prompt')
+  })
+
   await check('rollout discovery does not follow a symlinked root', () => {
     const link = join(root, 'codex-link')
     symlinkSync(codexRoot, link, 'dir')
@@ -688,6 +1247,13 @@ try {
       if (previous === undefined) delete process.env.DSH_TUI_SESSION_ROOT
       else process.env.DSH_TUI_SESSION_ROOT = previous
     }
+  })
+
+  await check('the platform temporary directory remains usable when it has an OS symlink ancestor', () => {
+    // macOS exposes os.tmpdir() below /var, and /var is a protected alias to
+    // /private/var. The safety guard must permit that OS-owned alias while
+    // continuing to reject user-created symlink components.
+    assert.doesNotThrow(() => assertSafeRoot(tmpdir(), 'temporary import root'))
   })
 
   await check('published sessions are attached to an available workspace registry', async () => {
@@ -743,6 +1309,54 @@ try {
     Buffer.from('28b52ffd', 'hex').copy(magicPayload, 500)
     const frame = zstdCompressSync(magicPayload)
     assert.deepEqual(decodeFrames(frame), [magicPayload.toString('utf8')])
+  })
+
+  await check('installed-log hashing preserves UTF-8 split across zstd frames', async () => {
+    const ts = now.toISOString()
+    const built = buildRecords([{ records: [
+      { type: 'session_meta', timestamp: ts, ordinal: 0, payload: { id: splitInstalledId, cwd: '/tmp/split-installed' } },
+      { type: 'event_msg', timestamp: ts, ordinal: 1, payload: { type: 'task_started' } },
+      { type: 'response_item', timestamp: ts, ordinal: 2, payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: '跨帧字符片' }],
+      } },
+      { type: 'response_item', timestamp: ts, ordinal: 3, payload: {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '已保留' }],
+      } },
+      { type: 'event_msg', timestamp: ts, ordinal: 4, payload: { type: 'task_complete' } },
+    ] }], splitInstalledId)
+    const out = join(root, 'split-installed-log')
+    const dir = sessionDirFor(built, out)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const body = Buffer.from(sessionBody(built), 'utf8')
+    const marker = Buffer.from('片', 'utf8')
+    const cut = body.indexOf(marker) + 1
+    assert.ok(cut > 0)
+    const header = Buffer.from(`${JSON.stringify(built.records[0])}\n`, 'utf8')
+    writeFileSync(join(dir, 'session.v3.jsonl.zstd'), Buffer.concat([
+      zstdCompressSync(header),
+      zstdCompressSync(body.subarray(0, cut)),
+      zstdCompressSync(body.subarray(cut)),
+    ]))
+    const log = join(dir, 'session.v3.jsonl.zstd')
+    assert.equal(readSessionLog(log).bodySha256, bodySha256(built))
+    const verified = await verifyPaths([out], { quiet: true })
+    assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
+  await check('tool verification rejects incomplete call bookkeeping', () => {
+    const assistant = {
+      type: 'assistant/message', seq: 1, data: { message: {
+        content: [{ type: 'tool-call', id: 'declared-only', name: 'x', arguments: '{}' }],
+      } },
+    }
+    assert.throws(() => assertToolCallPairing([assistant]), /no tool\/call event/i)
+    const result = {
+      type: 'tool/result', seq: 2, data: { message: {
+        source: { callId: 'result-only' },
+        content: [{ type: 'tool-result', toolCallId: 'result-only', content: [] }],
+      } },
+    }
+    assert.throws(() => assertToolCallPairing([result]), /no assistant.*tool-call/i)
   })
 
   await check('image detection tolerates pretty-printed event JSON', () => {
@@ -907,6 +1521,41 @@ try {
     assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
   })
 
+  await check('duplicate raw tool ids are renamed while both results stay paired', async () => {
+    const out = join(root, 'scratch-duplicate-call-ids')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [duplicateCallId] })
+    assert.equal(imported.results.length, 1)
+    const log = join(imported.results[0].dir, 'session.v3.jsonl.zstd')
+    const events = decodeFrames(readFileSync(log)).slice(1).join('').split('\n')
+      .filter(Boolean).map((line) => JSON.parse(line))
+    const calls = events.filter((event) => event.type === 'tool/call')
+    const results = events.filter((event) => event.type === 'tool/result')
+    assert.equal(calls.length, 2)
+    assert.equal(results.length, 2)
+    assert.equal(new Set(calls.map((event) => event.data.callId)).size, 2)
+    assert.deepEqual(results.map((event) => event.data.message.content[0].content[0].text), [
+      'first result', 'second result',
+    ])
+    const verified = await verifyPaths([out], { quiet: true })
+    assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
+  await check('duplicate raw ids keep distinct telemetry completions paired', async () => {
+    const out = join(root, 'scratch-duplicate-event-call-ids')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [duplicateEventCallId] })
+    assert.equal(imported.results.length, 1)
+    const log = join(imported.results[0].dir, 'session.v3.jsonl.zstd')
+    const events = decodeFrames(readFileSync(log)).slice(1).join('').split('\n')
+      .filter(Boolean).map((line) => JSON.parse(line))
+    const results = events.filter((event) => event.type === 'tool/result')
+    assert.deepEqual(results.map((event) => event.data.message.content[0].content[0].text), [
+      'first event result', 'second event result',
+    ])
+    assert.ok(results.every((event) => event.data.message.content[0].isError === false))
+    const verified = await verifyPaths([out], { quiet: true })
+    assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
   await check('local shell items and command failures survive conversion', async () => {
     const shellPath = fileFor(shellId, 'local-shell')
     writeFileSync(shellPath, [
@@ -1012,6 +1661,12 @@ try {
     const result = events.find((event) => event.type === 'tool/result')
     assert.match(result.data.message.content[0].content[0].text, /structured failure/)
     assert.equal(result.data.message.content[0].isError, true)
+  })
+
+  await check('primitive tool outputs remain readable strings', () => {
+    assert.equal(outputText({ output: 0 }), '0')
+    assert.equal(outputText({ output: false }), 'false')
+    assert.equal(outputText({ output: { result: 7 } }), '{"result":7}')
   })
 
   await check('failed structured shell output is marked without an exit code', async () => {
@@ -1123,6 +1778,39 @@ try {
     assert.equal(existsSync(join(outside, key.slice(project.length + 1))), false)
   })
 
+  await check('a symlink used as the scratch root is refused', async () => {
+    const scratchReal = join(root, 'scratch-real-root')
+    const scratchLink = join(root, 'scratch-root-link')
+    const live = join(root, 'live-scratch-root-link')
+    const result = (await runImport({ root: scratchReal, codexRoot, sessionIds: [idA] })).results[0]
+    symlinkSync(scratchReal, scratchLink, 'dir')
+    assert.throws(() => syncSessions(scratchLink, live, [result]), /scratch root|symbolic|regular directory/i)
+  })
+
+  await check('dot-dot paths cannot hide a symlink component', () => {
+    const real = join(root, 'dotdot-real')
+    const link = join(root, 'dotdot-link')
+    mkdirSync(real, { recursive: true, mode: 0o700 })
+    symlinkSync(real, link, 'dir')
+    assert.throws(
+      () => assertSafeRoot(`${link}/../dotdot-target`, 'output root'),
+      /symbolic-link component|symbolic-link ancestor/i,
+    )
+  })
+
+  await check('a nonexistent output root below a symlink is refused before writing', async () => {
+    const parentReal = join(root, 'output-parent-real')
+    const parentLink = join(root, 'output-parent-link')
+    mkdirSync(parentReal, { recursive: true, mode: 0o700 })
+    symlinkSync(parentReal, parentLink, 'dir')
+    const output = join(parentLink, 'new-output')
+    await assert.rejects(
+      runImport({ root: output, codexRoot, sessionIds: [idA] }),
+      /output root.*symbolic-link (?:ancestor|component)/i,
+    )
+    assert.deepEqual(readdirSync(parentReal), [])
+  })
+
   await check('a symlink used as the sessions root is refused', async () => {
     const scratch = join(root, 'scratch-root-symlink')
     const real = join(root, 'live-root-real')
@@ -1131,6 +1819,51 @@ try {
     mkdirSync(real, { recursive: true })
     symlinkSync(real, link, 'dir')
     assert.throws(() => syncSessions(scratch, link, [result]), /regular directory|symbolic/i)
+  })
+
+  await check('a disappearing scratch root becomes a refusal instead of an exception', () => {
+    const scratch = join(root, 'scratch-disappearing')
+    const live = join(root, 'live-disappearing')
+    mkdirSync(scratch, { recursive: true, mode: 0o700 })
+    mkdirSync(live, { recursive: true, mode: 0o700 })
+    rmSync(scratch, { recursive: true, force: true })
+    const buckets = syncSessions(scratch, live, [])
+    assert.equal(buckets.installed.length, 0)
+    assert.equal(buckets.refused.length, 1)
+    assert.equal(buckets.refused[0].key, '<scratch>')
+  })
+
+  await check('an output log symlink is rejected without touching its target', async () => {
+    const out = join(root, 'output-log-symlink')
+    const dir = join(out, projectKey('/tmp/project'), encodeSegment(`session-${idA}`))
+    const outside = join(root, 'output-log-symlink-target.txt')
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    writeFileSync(outside, 'outside stays unchanged\n')
+    symlinkSync(outside, join(dir, 'session.v3.jsonl.zstd'), 'file')
+    await assert.rejects(
+      runImport({ root: out, codexRoot, sessionIds: [idA] }),
+      /output session log.*symbolic link/i,
+    )
+    assert.equal(readFileSync(outside, 'utf8'), 'outside stays unchanged\n')
+    assert.equal(readdirSync(dir).filter((name) => name.includes('.tmp-')).length, 0)
+  })
+
+  await check('a symlinked manifest archive directory is refused before metadata writes', () => {
+    const parent = join(root, 'manifest-symlink-parent')
+    const live = join(parent, 'live-manifest-symlink')
+    const outside = join(parent, 'manifest-symlink-target')
+    mkdirSync(live, { recursive: true, mode: 0o700 })
+    mkdirSync(outside, { recursive: true, mode: 0o700 })
+    const link = join(parent, 'codex-import-manifests')
+    symlinkSync(outside, link, 'dir')
+    try {
+      assert.throws(() => writeManifest(live, {
+        installed: ['project/session'], backups: [], newDigests: {}, runId: 'safe-run-id',
+      }), /symbolic-link ancestor|metadata path|regular directory/i)
+      assert.deepEqual(readdirSync(outside), [])
+    } finally {
+      rmSync(link, { force: true })
+    }
   })
 
   await check('a symlinked rollback backup root is refused', async () => {

@@ -83,17 +83,17 @@ node bin/import-codex.mjs rollback --manifest /path/to/codex-import-manifests/<r
 
 最后一条最关键。DSH 是**每批事件追加一个 zstd 帧**，所以你在 DSH 里继续过的会话已经不是两帧日志了；重写它会删掉你自己的轮次。反过来，仍是两帧、但摘要与本导入器记录的不一致，说明有别的什么东西重写过它，同样不碰。`--force` 可以覆盖这个保护，它按设计就是破坏性的。若某次转换拿不到附件库（会把图片弄丢），也会被拒绝，而不会允许它覆盖一个本来就带图片的日志。同步会在 sessions 根目录旁维护 `codex-import-state.json`；只有实际安装或刷新会话时，才会在 `codex-import-manifests/` 保存独立的 JSON 清单。无变化重跑会保留之前的清单和撤销历史；旧版脚本需要的文本清单仍会同步生成。
 
-全程不删除任何东西，也不会把一个对话导入两次：刷新是替换文件，目录、目录里的其他文件、以及 session id 都保留。
+导入运行本身不会删除会话，也不会把一个对话导入两次：刷新是替换文件，目录、目录里的其他文件、以及 session id 都保留。只有显式执行回滚命令时，才会移除本次导入新建的会话。
 
 ## 保留什么，丢弃什么
 
 | | 结果 |
 | --- | --- |
-| 消息、工具调用与结果 | **完整导入**。若需要更小的会话，可用 `--max-tool-output N` 把每条工具输出截断到 N 字符；默认 0，即全部保留。缺失的调用或结果会补成明确占位并计入报告，非零退出会保留错误标记。 |
+| 消息、工具调用与结果 | **完整导入**，包括普通 `response_item` 缺失时可从 `item_completed` telemetry 恢复的可读消息。若需要更小的会话，可用 `--max-tool-output N` 把每条工具输出截断到 N 字符；默认 0，即全部保留。缺失的调用或结果会补成明确占位并计入报告，非零退出会保留错误标记。 |
 | 思维链 | 只有明文 `summary`，覆盖率约三分之一。其余是 OpenAI 服务端密钥的 Fernet 令牌，任何客户端都读不了。 |
-| 图片 | **会导入**，经附件库，兼容 App Server、telemetry 侧用户图片和结构化图片生成结果。过大的 base64 会在分配内存前拒绝；附件库实际拒绝会明确报告。 |
+| 图片 | **会导入**，经附件库，兼容 App Server、telemetry 侧用户图片和结构化图片生成结果。过大或格式错误的 base64 会在分配内存前拒绝；附件库实际拒绝会明确报告，正文会保留明确的“图片未附加”占位。 |
 | Codex 注入的上下文 | 丢弃。但 `# Files mentioned by the user:` 是**拆壳**而非丢弃 —— 它内部裹着真人的原始提问。 |
-| 压缩标记、world state、token 计数、子 agent 信封 | 丢弃：属于上下文管道，不是对话内容。只存在于压缩 `replacement_history` 里的消息会被捞回来。 |
+| 压缩标记、world state、token 计数、子 agent 信封 | 丢弃：属于上下文管道，不是对话内容。可读的旧式 `agent_message` 文本，以及只存在于压缩 `replacement_history` 里的消息会被捞回来。 |
 | Codex 工具名（`exec`、`shell` 等） | 原样保留为历史供模型阅读，但在 DSH 里不可调用。 |
 
 导入的图片只有在**当前模型支持图片**时才真正可见。模型目录条目若未声明 `inputModalities`，会默认为纯文本，harness 会在请求发出前把图片替换成
@@ -133,7 +133,7 @@ scripts/reinstall.sh          # 重新拷贝进 dsh-tui profile，然后重启 d
 
 ```sh
 npm run test:setup     # 每个 clone 只需执行一次：下载隔离的 DSH 测试运行时
-npm test              # 先测确定性回归，再测对齐行为和 /import-codex 命令本体
+npm test              # 回归、对齐、/import-codex 命令本体，以及 ACP resume 烟测
 node scripts/test-sync.mjs --keep     # 保留临时目录以便排查
 ```
 
