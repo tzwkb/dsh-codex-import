@@ -53,7 +53,7 @@
     }
   },
   "scripts": {
-    "test:setup": "npm install --prefix .test-runtime --no-save --package-lock=false --ignore-scripts --cache .test-runtime/npm-cache @deepseek-ai/dsh@0.1.5-rc.1",
+    "test:setup": "npm ci --prefix .test-runtime --ignore-scripts --cache .test-runtime/npm-cache",
     "test": "node scripts/test-regressions.mjs && node scripts/test-sync.mjs && node scripts/test-plugin.mjs && node scripts/test-acp.mjs",
     "test:regressions": "node scripts/test-regressions.mjs",
     "test:sync": "node scripts/test-sync.mjs",

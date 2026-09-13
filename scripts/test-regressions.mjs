@@ -8,7 +8,7 @@
  */
 import {
   rmSync, mkdirSync, writeFileSync, readFileSync,
-  cpSync, statSync, existsSync, readdirSync, symlinkSync,
+  cpSync, statSync, existsSync, readdirSync, symlinkSync, lstatSync,
 } from 'node:fs'
 import { join, relative } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -20,7 +20,7 @@ import {
   findRollouts, runImport, buildRecords, sessionBody, serializeSession, bodySha256,
   sessionDirFor, encodeSegment, projectKey,
 } from '../lib/convert.js'
-import { assertSafeRoot, syncSessions, writeManifest, rollbackManifest, legacyManifestPath, rollbackResultPath } from '../lib/sync.js'
+import { assertSafeRoot, syncSessions, writeManifest, rollbackManifest, legacyManifestPath, rollbackResultPath, statePath, manifestPath } from '../lib/sync.js'
 import { readSessionLog, decodeFrames, verifyPaths, findLogs, assertToolCallPairing } from '../lib/verify.js'
 import { sessionsRoot, groupIntoWorkspaces } from '../lib/index.js'
 import { customToolArguments, outputIsError, outputText } from '../lib/codex-payload.js'
@@ -1859,11 +1859,60 @@ try {
     try {
       assert.throws(() => writeManifest(live, {
         installed: ['project/session'], backups: [], newDigests: {}, runId: 'safe-run-id',
-      }), /symbolic-link ancestor|metadata path|regular directory/i)
+      }), /symbolic-link ancestor|metadata (?:path|directory)|regular directory/i)
       assert.deepEqual(readdirSync(outside), [])
     } finally {
       rmSync(link, { force: true })
     }
+  })
+
+  await check('a symlinked ownership state is refused before session publication', async () => {
+    const scratch = join(root, 'scratch-state-file-link')
+    const parent = join(root, 'state-file-link-parent')
+    const live = join(parent, 'live-state-file-link')
+    const outside = join(parent, 'state-file-link-target.json')
+    const result = (await runImport({ root: scratch, codexRoot, sessionIds: [idA] })).results[0]
+    mkdirSync(live, { recursive: true, mode: 0o700 })
+    writeFileSync(outside, '{"version":1,"sessions":{}}\n', { mode: 0o600 })
+    const link = statePath(live)
+    symlinkSync(outside, link, 'file')
+    const buckets = syncSessions(scratch, live, [result])
+    assert.equal(buckets.installed.length, 0)
+    assert.equal(buckets.refused.length, 1)
+    assert.match(buckets.refused[0].reason, /metadata target.*symbolic link/i)
+    assert.equal(lstatSync(link).isSymbolicLink(), true)
+    assert.equal(readFileSync(outside, 'utf8'), '{"version":1,"sessions":{}}\n')
+    assert.equal(existsSync(join(live, relative(scratch, result.dir), 'session.v3.jsonl.zstd')), false)
+  })
+
+  await check('a symlinked latest manifest is preserved and never replaced', () => {
+    const parent = join(root, 'latest-manifest-file-link-parent')
+    const live = join(parent, 'live-latest-manifest-file-link')
+    const outside = join(parent, 'latest-manifest-file-link-target.json')
+    mkdirSync(live, { recursive: true, mode: 0o700 })
+    writeFileSync(outside, '{"keep":true}\n', { mode: 0o600 })
+    const link = manifestPath(live)
+    symlinkSync(outside, link, 'file')
+    assert.throws(
+      () => writeManifest(live, {
+        installed: ['project/session'], backups: [], newDigests: {}, runId: 'safe-run-id',
+      }),
+      /metadata target.*symbolic link/i,
+    )
+    assert.equal(lstatSync(link).isSymbolicLink(), true)
+    assert.equal(readFileSync(outside, 'utf8'), '{"keep":true}\n')
+  })
+
+  await check('a symlinked rollback manifest is rejected without reading its target', () => {
+    const parent = join(root, 'rollback-manifest-file-link-parent')
+    const live = join(parent, 'live-rollback-manifest-file-link')
+    const outside = join(parent, 'rollback-manifest-file-link-target.json')
+    mkdirSync(live, { recursive: true, mode: 0o700 })
+    writeFileSync(outside, JSON.stringify({ version: 2, liveRoot: live, remove: [], restore: [] }) + '\n')
+    const link = join(parent, 'manifest-link.json')
+    symlinkSync(outside, link, 'file')
+    assert.throws(() => rollbackManifest(link), /rollback manifest.*symbolic link/i)
+    assert.equal(lstatSync(link).isSymbolicLink(), true)
   })
 
   await check('a symlinked rollback backup root is refused', async () => {
@@ -1887,6 +1936,7 @@ try {
       const buckets = syncSessions(scratchNew, live, [fresh])
       assert.equal(buckets.refreshed.length, 0)
       assert.equal(buckets.refused.length, 1)
+      assert.match(buckets.refused[0].reason, /metadata directory.*symbolic link/i)
       assert.deepEqual(readFileSync(join(live, key, 'session.v3.jsonl.zstd')), before)
       assert.equal(readdirSync(outside).length, 0)
     } finally {

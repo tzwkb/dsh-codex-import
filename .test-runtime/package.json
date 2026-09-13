@@ -1,0 +1,8 @@
+{
+  "name": "dsh-codex-import-test-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.1"
+  }
+}

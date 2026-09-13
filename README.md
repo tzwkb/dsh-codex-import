@@ -134,13 +134,15 @@ scripts/reinstall.sh          # re-copies into the dsh-tui profile, then restart
 
 `scripts/reinstall.sh <profile>` targets another profile. Re-running `dsh plugin add` refreshes an existing `file:` dependency in place; removing first is not required.
 
-Tests use a synthetic Codex corpus and a throwaway `DSH_HOME` under `.test-work`, so they never read your personal history. Verification loads a pinned DSH runtime downloaded into `.test-runtime`; no global DSH, `~/.dsh`, or `~/.codex` data is touched. The deterministic regression suite also covers malformed input, zstd magic collisions, bounded discovery, dry-run side effects, rollback history, and symlink guards:
+Tests use a synthetic Codex corpus and a throwaway `DSH_HOME` under `.test-work`, so they never read your personal history. Verification loads the lockfile-pinned DSH runtime into `.test-runtime`; no global DSH, `~/.dsh`, or `~/.codex` data is touched. The deterministic regression suite also covers malformed input, zstd magic collisions, bounded discovery, dry-run side effects, rollback history, and symlink guards:
 
 ```sh
 npm run test:setup     # once per clone: download the isolated DSH test runtime
 npm test              # regressions, reconcile behaviour, slash command, and ACP resume smoke tests
 node scripts/test-sync.mjs --keep     # leave the scratch tree for inspection
 ```
+
+GitHub Actions runs the same suite, syntax checks, and a publish-content audit on both Ubuntu and macOS for every push to `main` and every pull request.
 
 `test-sync.mjs` covers determinism, install, no-op re-sync, in-place refresh, both refusal cases, `--force`, and the image guard. `test-plugin.mjs` composes the plugin the way the harness does and invokes the handler, because the slash command is the surface that actually gets used and no other test reaches it.
 

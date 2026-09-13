@@ -1,0 +1,48 @@
+name: stability
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node 22.15 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.15.0
+
+      - name: Cache isolated DSH downloads
+        uses: actions/cache@v4
+        with:
+          path: .test-runtime/npm-cache
+          key: dsh-test-runtime-${{ runner.os }}-${{ hashFiles('.test-runtime/package-lock.json') }}
+
+      - name: Install isolated DSH test runtime
+        run: npm run test:setup
+
+      - name: Check JavaScript syntax
+        run: find bin lib scripts -type f \( -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 -n1 node --check
+
+      - name: Run stability suite
+        run: npm test
+
+      - name: Audit publish contents
+        run: npm pack --dry-run

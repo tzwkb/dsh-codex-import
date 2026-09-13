@@ -129,13 +129,15 @@ scripts/reinstall.sh          # 重新拷贝进 dsh-tui profile，然后重启 d
 
 `scripts/reinstall.sh <profile>` 可指定其他 profile。重复执行 `dsh plugin add` 会原地刷新已有的 `file:` 依赖，不需要先 remove。
 
-测试使用项目 `.test-work` 下生成的合成 Codex 语料和一次性的 `DSH_HOME`，不会读取你的个人历史。校验器使用下载到 `.test-runtime` 的固定版本 DSH 运行时，不会调用全局 DSH，也不会碰 `~/.dsh` 或 `~/.codex`。确定性回归套件覆盖损坏输入、zstd 魔数冲突、低内存扫描、dry-run 副作用、回滚历史和软链接防护：
+测试使用项目 `.test-work` 下生成的合成 Codex 语料和一次性的 `DSH_HOME`，不会读取你的个人历史。校验器使用按 lockfile 固定依赖树、下载到 `.test-runtime` 的 DSH 运行时，不会调用全局 DSH，也不会碰 `~/.dsh` 或 `~/.codex`。确定性回归套件覆盖损坏输入、zstd 魔数冲突、低内存扫描、dry-run 副作用、回滚历史和软链接防护：
 
 ```sh
 npm run test:setup     # 每个 clone 只需执行一次：下载隔离的 DSH 测试运行时
 npm test              # 回归、对齐、/import-codex 命令本体，以及 ACP resume 烟测
 node scripts/test-sync.mjs --keep     # 保留临时目录以便排查
 ```
+
+每次向 `main` 推送以及每个 Pull Request，GitHub Actions 都会在 Ubuntu 与 macOS 上运行同一套测试、语法检查和发布内容审计。
 
 `test-sync.mjs` 覆盖确定性、安装、无变化重跑、原地刷新、两种拒绝、`--force` 与图片保护；`test-plugin.mjs` 按 harness 的方式组装插件并真正调用命令处理器 —— 斜杠命令才是实际使用的入口，其他测试都到不了那里。
 

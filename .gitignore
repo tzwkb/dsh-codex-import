@@ -1,6 +1,7 @@
 # Dependencies (the plugin has none, but a local install may create these)
 node_modules/
-.test-runtime/
+.test-runtime/node_modules/
+.test-runtime/npm-cache/
 .test-work/
 
 # Local scratch output from bin/import-codex.mjs

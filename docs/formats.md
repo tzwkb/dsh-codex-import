@@ -262,8 +262,10 @@ remains available for callers that explicitly want the eager API.
 
 The sync path stages a new session beside its destination and renames it into
 place only after the source is complete. Existing destination ancestors and log
-symlinks are refused, and a malformed source cannot abort valid siblings. State
-and manifests are written atomically with restrictive permissions. A sync updates
+symlinks are refused, and a malformed source cannot abort valid siblings. State,
+manifest, backup, and rollback paths are preflighted before session publication;
+symlinked or non-regular metadata targets are refused without replacing them.
+State and manifests are written atomically with restrictive permissions. A sync updates
 the state file; when it installs or refreshes a session it also writes an
 immutable JSON manifest under `codex-import-manifests/<run-id>.json`, updates the
 convenience `codex-import-manifest.json`, and keeps the pre-0.2 text file for
