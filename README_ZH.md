@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-blue.svg)](cordis.patch.yml)
-[![Node](https://img.shields.io/badge/Node-22.15%2B-blue.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/Node-22.19%2B-blue.svg)](https://nodejs.org/)
 
 [English](README.md) | 中文
 
@@ -116,7 +116,7 @@ DSH 会**三次**校验会话日志，而较弱的检查并不足够 —— 一�
 ## 环境要求
 
 - 已安装 `dsh-tui` profile 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-- Node.js 22.15+（转换器和校验器使用 Node 原生 Zstandard API）
+- Node.js 22.19+（转换器和校验器使用 Node 原生 Zstandard API；DSH ACP 运行时也以此为最低版本）
 - Codex 数据位于 `$CODEX_HOME/sessions`（默认 `~/.codex/sessions`）
 
 ## 开发

@@ -23,7 +23,7 @@
   },
   "homepage": "https://github.com/tzwkb/dsh-codex-import#readme",
   "engines": {
-    "node": ">=22.15"
+    "node": ">=22.19"
   },
   "main": "lib/index.js",
   "bin": {

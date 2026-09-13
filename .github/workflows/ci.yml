@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    name: Node 22.15 / ${{ matrix.os }}
+    name: Node 22.19 / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.15.0
+          node-version: 22.19.0
 
       - name: Cache isolated DSH downloads
         uses: actions/cache@v4

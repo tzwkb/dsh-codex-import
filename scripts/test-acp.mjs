@@ -34,6 +34,12 @@ let child
 const pending = new Map()
 let nextRequestId = 1
 let output = ''
+let stderrOutput = ''
+
+const childDiagnostic = () => {
+  const detail = stderrOutput.trim()
+  return detail.length === 0 ? '' : `; stderr: ${detail.slice(-4_000)}`
+}
 
 const rejectPending = (error) => {
   for (const request of pending.values()) {
@@ -97,7 +103,9 @@ try {
   })
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')
-  child.stderr.on('data', () => {})
+  child.stderr.on('data', (chunk) => {
+    stderrOutput += chunk
+  })
   child.stdout.on('data', (chunk) => {
     output += chunk
     let newline
@@ -115,7 +123,11 @@ try {
       else current.resolve(message.result)
     }
   })
-  child.on('close', (code) => rejectPending(new Error(`ACP process closed (${code})`)))
+  child.on('error', (error) => rejectPending(new Error(`ACP process failed to start: ${error.message}`)))
+  child.on('close', (code, signal) => {
+    const suffix = signal === null ? '' : `, signal ${signal}`
+    rejectPending(new Error(`ACP process closed (${code}${suffix})${childDiagnostic()}`))
+  })
 
   const initialized = await request('initialize', {
     protocolVersion: 1,

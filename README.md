@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-blue.svg)](cordis.patch.yml)
-[![Node](https://img.shields.io/badge/Node-22.15%2B-blue.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/Node-22.19%2B-blue.svg)](https://nodejs.org/)
 
 English | [中文](README_ZH.md)
 
@@ -121,7 +121,7 @@ DSH validates a session log three times, and the weaker checks are not enough �
 ## Requirements
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with the `dsh-tui` profile installed
-- Node.js 22.15+ (the converter and verifier use Node's native Zstandard API)
+- Node.js 22.19+ (the converter and verifier use Node's native Zstandard API; the DSH ACP runtime requires the same baseline)
 - Codex data under `$CODEX_HOME/sessions` (default `~/.codex/sessions`)
 
 ## Development
