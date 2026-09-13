@@ -137,7 +137,7 @@ npm test              # 回归、对齐、/import-codex 命令本体，以及 AC
 node scripts/test-sync.mjs --keep     # 保留临时目录以便排查
 ```
 
-每次向 `main` 推送以及每个 Pull Request，GitHub Actions 都会在 Ubuntu 与 macOS 上运行同一套测试、语法检查和发布内容审计。
+每次向 `main` 推送以及每个 Pull Request，GitHub Actions 都会在 Ubuntu 与 macOS 上用最低支持的 Node 22.19 和当前 Node 24 线分别运行同一套测试、语法检查和发布内容审计。
 
 `test-sync.mjs` 覆盖确定性、安装、无变化重跑、原地刷新、两种拒绝、`--force` 与图片保护；`test-plugin.mjs` 按 harness 的方式组装插件并真正调用命令处理器 —— 斜杠命令才是实际使用的入口，其他测试都到不了那里。
 

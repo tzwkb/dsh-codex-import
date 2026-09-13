@@ -142,7 +142,7 @@ npm test              # regressions, reconcile behaviour, slash command, and ACP
 node scripts/test-sync.mjs --keep     # leave the scratch tree for inspection
 ```
 
-GitHub Actions runs the same suite, syntax checks, and a publish-content audit on both Ubuntu and macOS for every push to `main` and every pull request.
+GitHub Actions runs the same suite, syntax checks, and a publish-content audit on both Ubuntu and macOS, using the minimum supported Node 22.19 and the current Node 24 line, for every push to `main` and every pull request.
 
 `test-sync.mjs` covers determinism, install, no-op re-sync, in-place refresh, both refusal cases, `--force`, and the image guard. `test-plugin.mjs` composes the plugin the way the harness does and invokes the handler, because the slash command is the surface that actually gets used and no other test reaches it.
 

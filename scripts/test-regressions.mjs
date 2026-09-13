@@ -1862,7 +1862,9 @@ try {
       }), /symbolic-link ancestor|metadata (?:path|directory)|regular directory/i)
       assert.deepEqual(readdirSync(outside), [])
     } finally {
-      rmSync(link, { force: true })
+      // Node 24 requires recursive=true when removing a directory symlink;
+      // the flag still removes the link itself without traversing its target.
+      rmSync(link, { recursive: true, force: true })
     }
   })
 
@@ -1940,7 +1942,9 @@ try {
       assert.deepEqual(readFileSync(join(live, key, 'session.v3.jsonl.zstd')), before)
       assert.equal(readdirSync(outside).length, 0)
     } finally {
-      rmSync(backupLink, { force: true })
+      // Keep the cleanup portable across Node 22 and Node 24: recursive=true
+      // removes the directory link, never the directory it points at.
+      rmSync(backupLink, { recursive: true, force: true })
       writeFileSync(source, original)
     }
   })
