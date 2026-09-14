@@ -18,7 +18,7 @@ import assert from 'node:assert/strict'
 import {
   collectConversationRefs, iterateConversations, listConversations, collectImages,
   findRollouts, runImport, buildRecords, sessionBody, serializeSession, bodySha256,
-  sessionDirFor, encodeSegment, projectKey,
+  sessionDirFor, encodeSegment, projectKey, formatLocalMinute,
 } from '../lib/convert.js'
 import { assertSafeRoot, syncSessions, writeManifest, rollbackManifest, legacyManifestPath, rollbackResultPath, statePath, manifestPath } from '../lib/sync.js'
 import { readSessionLog, decodeFrames, verifyPaths, findLogs, assertToolCallPairing } from '../lib/verify.js'
@@ -26,7 +26,7 @@ import { sessionsRoot, groupIntoWorkspaces } from '../lib/index.js'
 import { customToolArguments, outputIsError, outputText } from '../lib/codex-payload.js'
 import { decodeDataUrl, generatedImageOf, MAX_IMAGE_BYTES } from '../lib/codex-images.js'
 import { itemFailed, userText } from '../lib/codex-message.js'
-import { isSubagentMetadata, projectMatches, readRecords } from '../lib/codex-discovery.js'
+import { isSubagentMetadata, projectMatches, readRecords, lastRecordTimestamp } from '../lib/codex-discovery.js'
 import { makeTestRoot, cleanTestRoot } from './test-env.mjs'
 
 const root = makeTestRoot('codex-regression')
@@ -46,6 +46,12 @@ const fileFor = (id, suffix = id) => join(codexRoot, `rollout-${stamp}-${suffix}
 const oldFileFor = (suffix) => join(codexRoot, `rollout-2000-01-01T00-00-00-${suffix}.jsonl`)
 const record = (id, ordinal, type, payload, timestamp = now.toISOString()) =>
   JSON.stringify({ timestamp, ordinal, type, payload })
+// A rollout whose *records* are old: discovery reads the newest record to decide
+// whether Codex is still appending, so an old filename alone no longer keeps a
+// fixture out of a recent window.
+const OLD_STAMP = '2000-01-01T00:00:00.000Z'
+const oldRecord = (id, ordinal, type, payload, timestamp = OLD_STAMP) =>
+  record(id, ordinal, type, payload, timestamp)
 const writeRollout = (path, id, prompt, output = 'ok', image = false) => {
   const lines = [
     record(id, 0, 'session_meta', {
@@ -111,95 +117,95 @@ writeRollout(invalidPath, '01999999-aaaa-7bbb-8ccc-000000000099', 'invalid date'
 // duplicate message id in both segments so the merger has to fold it once.
 const lineageOne = oldFileFor('lineage-child')
 const lineageTwo = oldFileFor('lineage-root')
-const lineageMeta = (id, extra = {}) => record(id, 0, 'session_meta', {
+const lineageMeta = (id, extra = {}) => oldRecord(id, 0, 'session_meta', {
   id, cwd: '/tmp/lineage-project', model_provider: 'openai', model: 'codex',
   timestamp: now.toISOString(), ...extra,
 })
-const lineageUser = record(lineageChildId, 2, 'response_item', {
+const lineageUser = oldRecord(lineageChildId, 2, 'response_item', {
   id: 'message-shared-1', type: 'message', role: 'user',
   content: [{ type: 'input_text', text: 'lineage prompt' }],
 })
-const lineageAssistant = record(lineageChildId, 3, 'response_item', {
+const lineageAssistant = oldRecord(lineageChildId, 3, 'response_item', {
   id: 'message-shared-2', type: 'message', role: 'assistant',
   content: [{ type: 'output_text', text: 'lineage answer' }],
 })
 writeFileSync(lineageOne, [
   lineageMeta(lineageChildId),
-  record(lineageChildId, 0.5, 'turn_context', { model: 'gpt-5.5' }),
+  oldRecord(lineageChildId, 0.5, 'turn_context', { model: 'gpt-5.5' }),
   lineageMeta(lineageRootId, { session_id: lineageRootId }),
-  record(lineageChildId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(lineageChildId, 1, 'event_msg', { type: 'task_started' }),
   lineageUser,
   lineageAssistant,
-  record(lineageChildId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(lineageChildId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(lineageTwo, [
   lineageMeta(lineageRootId, { session_id: lineageRootId }),
-  record(lineageRootId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(lineageRootId, 1, 'event_msg', { type: 'task_started' }),
   lineageUser,
   lineageAssistant,
-  record(lineageRootId, 4, 'response_item', {
+  oldRecord(lineageRootId, 4, 'response_item', {
     id: 'message-new-3', type: 'message', role: 'assistant',
     content: [{ type: 'output_text', text: 'second segment answer' }],
   }),
-  record(lineageRootId, 5, 'event_msg', { type: 'task_complete' }),
+  oldRecord(lineageRootId, 5, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('subagent'), [
   lineageMeta(subagentId, {
     session_id: lineageRootId, thread_source: 'subagent',
     source: { subagent: { parent_thread_id: lineageRootId } },
   }),
-  record(subagentId, 1, 'event_msg', { type: 'task_started' }),
-  record(subagentId, 2, 'response_item', {
+  oldRecord(subagentId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(subagentId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'subagent only' }],
   }),
-  record(subagentId, 3, 'event_msg', { type: 'task_complete' }),
+  oldRecord(subagentId, 3, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 const archivedRoot = join(root, 'codex', 'archived_sessions')
 mkdirSync(archivedRoot, { recursive: true })
 writeRollout(join(archivedRoot, `rollout-${stamp}-archived.jsonl`), archivedId, 'archived prompt')
 writeFileSync(oldFileFor('custom-tool'), [
-  record(customToolId, 0, 'session_meta', {
+  oldRecord(customToolId, 0, 'session_meta', {
     session_id: customToolId, cwd: '/tmp/project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(customToolId, 1, 'event_msg', { type: 'task_started' }),
-  record(customToolId, 2, 'response_item', {
+  oldRecord(customToolId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(customToolId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'custom tool test' }],
   }),
-  record(customToolId, 3, 'response_item', {
+  oldRecord(customToolId, 3, 'response_item', {
     type: 'custom_tool_call', call_id: 'custom-call-1', name: 'exec_command',
     input: 'tools.exec_command({command:"ls", opts:{cwd:\'/tmp/project\', verbose:true}})',
   }),
-  record(customToolId, 4, 'response_item', {
+  oldRecord(customToolId, 4, 'response_item', {
     type: 'custom_tool_call_output', call_id: 'custom-call-1', output: 'ok',
   }),
-  record(customToolId, 5, 'event_msg', { type: 'task_complete' }),
+  oldRecord(customToolId, 5, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('generated-image'), [
-  record(generatedImageId, 0, 'session_meta', {
+  oldRecord(generatedImageId, 0, 'session_meta', {
     session_id: generatedImageId, cwd: '/tmp/project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(generatedImageId, 1, 'event_msg', { type: 'task_started' }),
-  record(generatedImageId, 2, 'response_item', {
+  oldRecord(generatedImageId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(generatedImageId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'generate an image' }],
   }),
-  record(generatedImageId, 3, 'response_item', {
+  oldRecord(generatedImageId, 3, 'response_item', {
     type: 'imageGeneration', id: 'image-call-1', action: { prompt: 'a blue square' },
     result: { b64Json: onePixelPng }, status: 'completed',
   }),
-  record(generatedImageId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(generatedImageId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('telemetry-tail'), [
-  record(telemetryId, 0, 'session_meta', {
+  oldRecord(telemetryId, 0, 'session_meta', {
     id: telemetryId, cwd: '/tmp/telemetry-project', model_provider: 'openai', timestamp: now.toISOString(),
   }),
-  record(telemetryId, 1, 'turn_context', { model: 'gpt-5.5' }),
-  record(telemetryId, 2, 'event_msg', { type: 'task_started' }),
-  record(telemetryId, 3, 'response_item', {
+  oldRecord(telemetryId, 1, 'turn_context', { model: 'gpt-5.5' }),
+  oldRecord(telemetryId, 2, 'event_msg', { type: 'task_started' }),
+  oldRecord(telemetryId, 3, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'tail recovery' }],
   }),
-  record(telemetryId, 4, 'event_msg', {
+  oldRecord(telemetryId, 4, 'event_msg', {
     type: 'task_complete', last_agent_message: 'Recovered from telemetry',
   }),
 ].join('\n') + '\n')
@@ -208,113 +214,113 @@ writeFileSync(oldFileFor('telemetry-tail'), [
 // blocks directly inside an assistant message. Keep this fixture outside the
 // ordinary one-hour inventory; the targeted checks opt into the wide window.
 writeFileSync(oldFileFor('rich-schema'), [
-  record(richSchemaId, 0, 'session_meta', {
+  oldRecord(richSchemaId, 0, 'session_meta', {
     id: richSchemaId, cwd: '/tmp/rich-project', model_provider: 'openai',
     model: 'codex-rich', title: 'Rich schema title', timestamp: now.toISOString(),
   }),
-  record(richSchemaId, 1, 'event_msg', { type: 'task_started' }),
-  record(richSchemaId, 2, 'response_item', {
+  oldRecord(richSchemaId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(richSchemaId, 2, 'response_item', {
     type: 'userMessage', id: 'rich-user-1',
     content: [
       { type: 'text', text: 'rich schema prompt' },
       { type: 'inputImage', imageUrl: 'data:image/png;base64,' + onePixelPng },
     ],
   }),
-  record(richSchemaId, 3, 'response_item', {
+  oldRecord(richSchemaId, 3, 'response_item', {
     type: 'reasoning', id: 'rich-reasoning-1', summary: ['first thought', 'second thought'],
   }),
-  record(richSchemaId, 3.5, 'response_item', {
+  oldRecord(richSchemaId, 3.5, 'response_item', {
     type: 'reasoning', id: 'rich-reasoning-2', summary: 'single string thought',
   }),
-  record(richSchemaId, 4, 'response_item', {
+  oldRecord(richSchemaId, 4, 'response_item', {
     type: 'commandExecution', id: 'rich-command-1', command: 'echo rich',
     cwd: '/tmp/rich-project', status: 'completed', aggregatedOutput: 'rich output', exitCode: 0,
   }),
-  record(richSchemaId, 4.5, 'response_item', {
+  oldRecord(richSchemaId, 4.5, 'response_item', {
     type: 'fileChange', id: 'rich-file-1', status: 'completed',
     changes: [{ path: 'README.md', kind: 'update' }], result: { summary: 'README updated' },
   }),
-  record(richSchemaId, 5, 'response_item', {
+  oldRecord(richSchemaId, 5, 'response_item', {
     type: 'mcpToolCall', id: 'rich-mcp-1', server: 'demo', tool: 'lookup',
     status: 'failed', arguments: { query: 'x' }, result: null, error: { message: 'lookup failed' },
   }),
-  record(richSchemaId, 6, 'response_item', {
+  oldRecord(richSchemaId, 6, 'response_item', {
     type: 'message', id: 'rich-assistant-1', role: 'assistant', content: [
       { type: 'output_text', text: 'inline tool follows' },
       { type: 'toolUse', id: 'rich-inline-1', name: 'exec_command', input: { cmd: 'pwd' } },
     ],
   }),
-  record(richSchemaId, 7, 'response_item', {
+  oldRecord(richSchemaId, 7, 'response_item', {
     type: 'function_call_output', call_id: 'rich-inline-1', output: 'inline output',
   }),
-  record(richSchemaId, 8, 'response_item', {
+  oldRecord(richSchemaId, 8, 'response_item', {
     type: 'agentMessage', id: 'rich-agent-1', text: 'final rich answer', phase: 'final_answer',
   }),
-  record(richSchemaId, 9, 'event_msg', { type: 'task_complete' }),
+  oldRecord(richSchemaId, 9, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 writeFileSync(oldFileFor('model-switch'), [
-  record(modelSwitchId, 0, 'session_meta', {
+  oldRecord(modelSwitchId, 0, 'session_meta', {
     id: modelSwitchId, cwd: '/tmp/model-project', model_provider: 'openai',
     timestamp: now.toISOString(),
   }),
-  record(modelSwitchId, 1, 'turn_context', { turn_id: 'turn-a', model: 'gpt-a' }),
-  record(modelSwitchId, 2, 'event_msg', { type: 'task_started', turn_id: 'turn-a' }),
-  record(modelSwitchId, 3, 'response_item', {
+  oldRecord(modelSwitchId, 1, 'turn_context', { turn_id: 'turn-a', model: 'gpt-a' }),
+  oldRecord(modelSwitchId, 2, 'event_msg', { type: 'task_started', turn_id: 'turn-a' }),
+  oldRecord(modelSwitchId, 3, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'first model' }],
   }),
-  record(modelSwitchId, 4, 'response_item', {
+  oldRecord(modelSwitchId, 4, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer a' }],
   }),
-  record(modelSwitchId, 5, 'event_msg', { type: 'task_complete' }),
-  record(modelSwitchId, 6, 'turn_context', { turn_id: 'turn-b', model: 'gpt-b' }),
-  record(modelSwitchId, 7, 'event_msg', { type: 'task_started', turn_id: 'turn-b' }),
-  record(modelSwitchId, 8, 'response_item', {
+  oldRecord(modelSwitchId, 5, 'event_msg', { type: 'task_complete' }),
+  oldRecord(modelSwitchId, 6, 'turn_context', { turn_id: 'turn-b', model: 'gpt-b' }),
+  oldRecord(modelSwitchId, 7, 'event_msg', { type: 'task_started', turn_id: 'turn-b' }),
+  oldRecord(modelSwitchId, 8, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'second model' }],
   }),
-  record(modelSwitchId, 9, 'response_item', {
+  oldRecord(modelSwitchId, 9, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer b' }],
   }),
-  record(modelSwitchId, 10, 'event_msg', { type: 'task_complete' }),
+  oldRecord(modelSwitchId, 10, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 writeFileSync(oldFileFor('nested-outcome'), [
-  record(nestedOutcomeId, 0, 'session_meta', {
+  oldRecord(nestedOutcomeId, 0, 'session_meta', {
     id: nestedOutcomeId, cwd: '/tmp/nested-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(nestedOutcomeId, 1, 'event_msg', { type: 'task_started' }),
-  record(nestedOutcomeId, 2, 'response_item', {
+  oldRecord(nestedOutcomeId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(nestedOutcomeId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'nested completion' }],
   }),
-  record(nestedOutcomeId, 3, 'response_item', {
+  oldRecord(nestedOutcomeId, 3, 'response_item', {
     type: 'function_call', call_id: 'nested-call-1', name: 'exec_command', arguments: '{}',
   }),
-  record(nestedOutcomeId, 4, 'event_msg', {
+  oldRecord(nestedOutcomeId, 4, 'event_msg', {
     type: 'item_completed', item: {
       id: 'nested-call-1', type: 'commandExecution', status: 'completed',
       aggregatedOutput: 'nested completion output', exitCode: 0,
     },
   }),
-  record(nestedOutcomeId, 5, 'event_msg', { type: 'task_complete' }),
+  oldRecord(nestedOutcomeId, 5, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 // Codex's compaction worker can move cold rollouts to `.jsonl.zst`. Keep one
 // compressed fixture so discovery and conversion cannot silently regress to
 // plain-jsonl-only support.
 const compressedSource = [
-  record(compressedId, 0, 'session_meta', {
+  oldRecord(compressedId, 0, 'session_meta', {
     id: compressedId, cwd: '/tmp/compressed-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(compressedId, 1, 'event_msg', { type: 'task_started' }),
-  record(compressedId, 2, 'response_item', {
+  oldRecord(compressedId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(compressedId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compressed rollout prompt' }],
   }),
-  record(compressedId, 3, 'response_item', {
+  oldRecord(compressedId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'compressed rollout answer' }],
   }),
-  record(compressedId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(compressedId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n'
 const compressedPath = oldFileFor('compressed') + '.zst'
 writeFileSync(compressedPath, zstdCompressSync(Buffer.from(compressedSource, 'utf8')))
@@ -322,18 +328,18 @@ writeFileSync(compressedPath, zstdCompressSync(Buffer.from(compressedSource, 'ut
 // A source compressor may rotate frames in the middle of a JSON line. The
 // discovery reader must carry its UTF-8/line buffer across those boundaries.
 const splitCompressedSource = [
-  record(splitCompressedId, 0, 'session_meta', {
+  oldRecord(splitCompressedId, 0, 'session_meta', {
     id: splitCompressedId, cwd: '/tmp/split-compressed-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(splitCompressedId, 1, 'event_msg', { type: 'task_started' }),
-  record(splitCompressedId, 2, 'response_item', {
+  oldRecord(splitCompressedId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(splitCompressedId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'split frame prompt 分片' }],
   }),
-  record(splitCompressedId, 3, 'response_item', {
+  oldRecord(splitCompressedId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'split frame answer' }],
   }),
-  record(splitCompressedId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(splitCompressedId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n'
 const splitBytes = Buffer.from(splitCompressedSource, 'utf8')
 // Deliberately cut inside the three-byte UTF-8 encoding of `片`, not merely at
@@ -355,67 +361,67 @@ writeFileSync(brokenCompressedPath, Buffer.concat([
 const eventUserRollout = (id, name, includeResponse) => {
   const turnId = `${id}-turn`
   const lines = [
-    record(id, 0, 'session_meta', {
+    oldRecord(id, 0, 'session_meta', {
       id, cwd: `/tmp/${name}-project`, model_provider: 'openai', model: 'codex',
       timestamp: now.toISOString(),
     }),
-    record(id, 1, 'event_msg', { type: 'task_started' }),
-    record(id, 2, 'event_msg', {
+    oldRecord(id, 1, 'event_msg', { type: 'task_started' }),
+    oldRecord(id, 2, 'event_msg', {
       type: 'user_message', id: `${id}-telemetry-message`, turn_id: turnId,
       message: 'telemetry-only user prompt',
     }),
   ]
   if (includeResponse) {
-    lines.push(record(id, 3, 'response_item', {
+    lines.push(oldRecord(id, 3, 'response_item', {
       type: 'message', id: `${id}-response-message`, role: 'user',
       internal_chat_message_metadata_passthrough: { turn_id: turnId },
       content: [{ type: 'input_text', text: 'telemetry-only user prompt' }],
     }))
   }
-  lines.push(record(id, includeResponse ? 4 : 3, 'response_item', {
+  lines.push(oldRecord(id, includeResponse ? 4 : 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'telemetry answer' }],
   }))
-  lines.push(record(id, includeResponse ? 5 : 4, 'event_msg', { type: 'task_complete' }))
+  lines.push(oldRecord(id, includeResponse ? 5 : 4, 'event_msg', { type: 'task_complete' }))
   return lines.join('\n') + '\n'
 }
 writeFileSync(oldFileFor('telemetry-user'), eventUserRollout(telemetryUserId, 'telemetry-user', false))
 writeFileSync(oldFileFor('duplicate-user'), eventUserRollout(duplicateUserId, 'duplicate-user', true))
 writeFileSync(oldFileFor('null-metadata'), [
-  record(nullMetadataId, 0, 'session_meta', {
+  oldRecord(nullMetadataId, 0, 'session_meta', {
     id: nullMetadataId, cwd: '/tmp/null-metadata-project', model_provider: 'openai',
     timestamp: now.toISOString(),
   }),
-  record(nullMetadataId, 1, 'response_item', {
+  oldRecord(nullMetadataId, 1, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'null metadata prompt' }],
   }),
-  record(nullMetadataId, 2, 'session_meta', null),
-  record(nullMetadataId, 3, 'response_item', {
+  oldRecord(nullMetadataId, 2, 'session_meta', null),
+  oldRecord(nullMetadataId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'null metadata answer' }],
   }),
-  record(nullMetadataId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(nullMetadataId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('telemetry-image-only'), [
-  record(telemetryImageOnlyId, 0, 'session_meta', {
+  oldRecord(telemetryImageOnlyId, 0, 'session_meta', {
     id: telemetryImageOnlyId, cwd: '/tmp/telemetry-image-project', model_provider: 'openai',
     timestamp: now.toISOString(),
   }),
-  record(telemetryImageOnlyId, 1, 'event_msg', { type: 'task_started' }),
-  record(telemetryImageOnlyId, 2, 'event_msg', {
+  oldRecord(telemetryImageOnlyId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(telemetryImageOnlyId, 2, 'event_msg', {
     type: 'user_message',
     message: { content: [{ type: 'input_image', image_url: 'data:image/png;base64,' + onePixelPng }] },
   }),
-  record(telemetryImageOnlyId, 3, 'response_item', {
+  oldRecord(telemetryImageOnlyId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'image received' }],
   }),
-  record(telemetryImageOnlyId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(telemetryImageOnlyId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('nested-telemetry-user'), [
-  record(nestedTelemetryUserId, 0, 'session_meta', {
+  oldRecord(nestedTelemetryUserId, 0, 'session_meta', {
     id: nestedTelemetryUserId, cwd: '/tmp/nested-telemetry-project', model_provider: 'openai',
     timestamp: now.toISOString(),
   }),
-  record(nestedTelemetryUserId, 1, 'event_msg', { type: 'task_started' }),
-  record(nestedTelemetryUserId, 2, 'event_msg', {
+  oldRecord(nestedTelemetryUserId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(nestedTelemetryUserId, 2, 'event_msg', {
     type: 'item_completed',
     item: {
       type: 'UserMessage',
@@ -426,18 +432,18 @@ writeFileSync(oldFileFor('nested-telemetry-user'), [
       ],
     },
   }),
-  record(nestedTelemetryUserId, 3, 'response_item', {
+  oldRecord(nestedTelemetryUserId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'nested telemetry answer' }],
   }),
-  record(nestedTelemetryUserId, 4, 'event_msg', { type: 'task_complete' }),
+  oldRecord(nestedTelemetryUserId, 4, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('compaction-history'), [
-  record(compactionId, 0, 'session_meta', {
+  oldRecord(compactionId, 0, 'session_meta', {
     id: compactionId, cwd: '/tmp/compaction-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(compactionId, 1, 'event_msg', { type: 'task_started' }),
-  record(compactionId, 2, 'compacted', {
+  oldRecord(compactionId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(compactionId, 2, 'compacted', {
     replacement_history: [
       { type: 'message', id: 'history-user-1', role: 'user', content: [{ type: 'input_text', text: 'recovered compaction prompt' }] },
       { type: 'message', id: 'history-assistant-1', role: 'assistant', content: [{ type: 'output_text', text: 'recovered compaction answer' }] },
@@ -445,69 +451,69 @@ writeFileSync(oldFileFor('compaction-history'), [
       { type: 'compaction' },
     ],
   }),
-  record(compactionId, 3, 'response_item', {
+  oldRecord(compactionId, 3, 'response_item', {
     type: 'message', id: 'normal-user-1', role: 'user',
     content: [{ type: 'input_text', text: 'normal compaction prompt' }],
   }),
-  record(compactionId, 4, 'response_item', {
+  oldRecord(compactionId, 4, 'response_item', {
     type: 'message', id: 'normal-assistant-1', role: 'assistant',
     content: [{ type: 'output_text', text: 'normal compaction answer' }],
   }),
-  record(compactionId, 5, 'event_msg', { type: 'task_complete' }),
+  oldRecord(compactionId, 5, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 // The same human text can legitimately occur in separate turns. A telemetry
 // fallback must only mirror its matching turn, rather than being dropped by a
 // corpus-wide body-text set.
 writeFileSync(oldFileFor('repeated-prompt'), [
-  record(repeatedPromptId, 0, 'session_meta', {
+  oldRecord(repeatedPromptId, 0, 'session_meta', {
     id: repeatedPromptId, cwd: '/tmp/repeated-prompt-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(repeatedPromptId, 1, 'event_msg', { type: 'task_started', turn_id: 'repeat-turn-a' }),
-  record(repeatedPromptId, 2, 'response_item', {
+  oldRecord(repeatedPromptId, 1, 'event_msg', { type: 'task_started', turn_id: 'repeat-turn-a' }),
+  oldRecord(repeatedPromptId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'repeat me' }],
     internal_chat_message_metadata_passthrough: { turn_id: 'repeat-turn-a' },
   }),
-  record(repeatedPromptId, 3, 'response_item', {
+  oldRecord(repeatedPromptId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first answer' }],
   }),
-  record(repeatedPromptId, 4, 'event_msg', { type: 'task_complete', turn_id: 'repeat-turn-a' }),
-  record(repeatedPromptId, 5, 'event_msg', { type: 'task_started', turn_id: 'repeat-turn-b' }),
-  record(repeatedPromptId, 6, 'event_msg', {
+  oldRecord(repeatedPromptId, 4, 'event_msg', { type: 'task_complete', turn_id: 'repeat-turn-a' }),
+  oldRecord(repeatedPromptId, 5, 'event_msg', { type: 'task_started', turn_id: 'repeat-turn-b' }),
+  oldRecord(repeatedPromptId, 6, 'event_msg', {
     type: 'user_message', turn_id: 'repeat-turn-b', message: 'repeat me',
   }),
-  record(repeatedPromptId, 7, 'response_item', {
+  oldRecord(repeatedPromptId, 7, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'second answer' }],
   }),
-  record(repeatedPromptId, 8, 'event_msg', { type: 'task_complete', turn_id: 'repeat-turn-b' }),
+  oldRecord(repeatedPromptId, 8, 'event_msg', { type: 'task_complete', turn_id: 'repeat-turn-b' }),
 ].join('\n') + '\n')
 
 // Exercise case, separator, and camelCase aliases together with the alternate
 // compaction property spelling used by App Server exports.
 writeFileSync(oldFileFor('alias-schema'), [
-  record(aliasSchemaId, 0, 'session_meta', {
+  oldRecord(aliasSchemaId, 0, 'session_meta', {
     id: aliasSchemaId, cwd: '/tmp/alias-schema-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(aliasSchemaId, 1, 'event_msg', { type: 'TASK_STARTED' }),
-  record(aliasSchemaId, 2, 'response_item', {
+  oldRecord(aliasSchemaId, 1, 'event_msg', { type: 'TASK_STARTED' }),
+  oldRecord(aliasSchemaId, 2, 'response_item', {
     type: 'USER_MESSAGE', id: 'alias-user-1', text: 'uppercase user message',
   }),
-  record(aliasSchemaId, 3, 'response_item', {
+  oldRecord(aliasSchemaId, 3, 'response_item', {
     type: 'COMMAND-EXECUTION', id: 'alias-command-1', command: 'echo alias',
     status: 'COMPLETED', aggregatedOutput: 'alias command output', exitCode: 0,
   }),
-  record(aliasSchemaId, 4, 'response_item', {
+  oldRecord(aliasSchemaId, 4, 'response_item', {
     type: 'AGENTMESSAGE', id: 'alias-agent-1', text: 'uppercase agent answer',
   }),
-  record(aliasSchemaId, 5, 'compacted', {
+  oldRecord(aliasSchemaId, 5, 'compacted', {
     replacementHistory: [
       { type: 'UserMessage', id: 'alias-history-user', text: 'uppercase history prompt' },
       { type: 'AgentMessage', id: 'alias-history-agent', text: 'uppercase history answer' },
     ],
   }),
-  record(aliasSchemaId, 6, 'event_msg', { type: 'TASK_COMPLETE' }),
+  oldRecord(aliasSchemaId, 6, 'event_msg', { type: 'TASK_COMPLETE' }),
 ].join('\n') + '\n')
 
 // Newer Codex builds persist assistant messages in `event_msg.item_completed`
@@ -515,117 +521,117 @@ writeFileSync(oldFileFor('alias-schema'), [
 // telemetry-only fixture (plus a repeated mirror) so an interrupted tail is
 // recovered once, without inventing a second assistant message.
 writeFileSync(oldFileFor('assistant-telemetry'), [
-  record(assistantTelemetryId, 0, 'session_meta', {
+  oldRecord(assistantTelemetryId, 0, 'session_meta', {
     id: assistantTelemetryId, cwd: '/tmp/assistant-telemetry-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(assistantTelemetryId, 1, 'event_msg', { type: 'task_started', turn_id: 'assistant-telemetry-turn' }),
-  record(assistantTelemetryId, 2, 'event_msg', {
+  oldRecord(assistantTelemetryId, 1, 'event_msg', { type: 'task_started', turn_id: 'assistant-telemetry-turn' }),
+  oldRecord(assistantTelemetryId, 2, 'event_msg', {
     type: 'item_completed', turn_id: 'assistant-telemetry-turn', item: {
       type: 'AgentMessage', id: 'assistant-telemetry-message', phase: 'final_answer',
       content: [{ type: 'Text', text: 'assistant recovered from telemetry' }],
     },
   }),
-  record(assistantTelemetryId, 3, 'event_msg', {
+  oldRecord(assistantTelemetryId, 3, 'event_msg', {
     type: 'item_completed', turn_id: 'assistant-telemetry-turn', item: {
       type: 'AgentMessage', id: 'assistant-telemetry-message', phase: 'final_answer',
       content: [{ type: 'Text', text: 'assistant recovered from telemetry' }],
     },
   }),
-  record(assistantTelemetryId, 4, 'event_msg', { type: 'task_complete', turn_id: 'assistant-telemetry-turn' }),
+  oldRecord(assistantTelemetryId, 4, 'event_msg', { type: 'task_complete', turn_id: 'assistant-telemetry-turn' }),
 ].join('\n') + '\n')
 
 writeFileSync(oldFileFor('lifecycle-aliases'), [
-  record(lifecycleId, 0, 'session_meta', {
+  oldRecord(lifecycleId, 0, 'session_meta', {
     id: lifecycleId, cwd: '/tmp/lifecycle-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(lifecycleId, 1, 'event_msg', { type: 'turn_started', turn_id: 'alias-turn-1' }),
-  record(lifecycleId, 2, 'response_item', {
+  oldRecord(lifecycleId, 1, 'event_msg', { type: 'turn_started', turn_id: 'alias-turn-1' }),
+  oldRecord(lifecycleId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'alias turn one' }],
   }),
-  record(lifecycleId, 3, 'response_item', {
+  oldRecord(lifecycleId, 3, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer one' }],
   }),
-  record(lifecycleId, 4, 'event_msg', { type: 'turn_completed', turn_id: 'alias-turn-1' }),
-  record(lifecycleId, 5, 'event_msg', { type: 'turn_start', turn_id: 'alias-turn-2' }),
-  record(lifecycleId, 6, 'response_item', {
+  oldRecord(lifecycleId, 4, 'event_msg', { type: 'turn_completed', turn_id: 'alias-turn-1' }),
+  oldRecord(lifecycleId, 5, 'event_msg', { type: 'turn_start', turn_id: 'alias-turn-2' }),
+  oldRecord(lifecycleId, 6, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'alias turn two' }],
   }),
-  record(lifecycleId, 7, 'response_item', {
+  oldRecord(lifecycleId, 7, 'response_item', {
     type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer two' }],
   }),
-  record(lifecycleId, 8, 'event_msg', { type: 'turn_end', turn_id: 'alias-turn-2' }),
+  oldRecord(lifecycleId, 8, 'event_msg', { type: 'turn_end', turn_id: 'alias-turn-2' }),
 ].join('\n') + '\n')
 writeFileSync(oldFileFor('search-placeholders'), [
-  record(searchPlaceholderId, 0, 'session_meta', {
+  oldRecord(searchPlaceholderId, 0, 'session_meta', {
     id: searchPlaceholderId, cwd: '/tmp/search-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(searchPlaceholderId, 1, 'event_msg', { type: 'task_started' }),
-  record(searchPlaceholderId, 2, 'response_item', {
+  oldRecord(searchPlaceholderId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(searchPlaceholderId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'search placeholder test' }],
   }),
-  record(searchPlaceholderId, 3, 'response_item', {
+  oldRecord(searchPlaceholderId, 3, 'response_item', {
     type: 'web_search_call', call_id: 'web-no-output', action: { query: 'dsh' },
   }),
-  record(searchPlaceholderId, 4, 'response_item', {
+  oldRecord(searchPlaceholderId, 4, 'response_item', {
     type: 'tool_search_call', call_id: 'tool-no-output', arguments: { query: 'lookup' },
   }),
-  record(searchPlaceholderId, 5, 'event_msg', { type: 'task_complete' }),
+  oldRecord(searchPlaceholderId, 5, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 // Malformed exports have occasionally reused a raw call id. The importer must
 // preserve both exchanges while assigning DSH-safe, unique ids.
 writeFileSync(oldFileFor('duplicate-call-ids'), [
-  record(duplicateCallId, 0, 'session_meta', {
+  oldRecord(duplicateCallId, 0, 'session_meta', {
     id: duplicateCallId, cwd: '/tmp/duplicate-call-project', model_provider: 'openai', model: 'codex',
     timestamp: now.toISOString(),
   }),
-  record(duplicateCallId, 1, 'event_msg', { type: 'task_started' }),
-  record(duplicateCallId, 2, 'response_item', {
+  oldRecord(duplicateCallId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(duplicateCallId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'duplicate calls' }],
   }),
-  record(duplicateCallId, 3, 'response_item', {
+  oldRecord(duplicateCallId, 3, 'response_item', {
     type: 'function_call', call_id: 'same-raw-id', name: 'first_tool', arguments: '{}',
   }),
-  record(duplicateCallId, 4, 'response_item', {
+  oldRecord(duplicateCallId, 4, 'response_item', {
     type: 'function_call', call_id: 'same-raw-id', name: 'second_tool', arguments: '{}',
   }),
-  record(duplicateCallId, 5, 'response_item', {
+  oldRecord(duplicateCallId, 5, 'response_item', {
     type: 'function_call_output', call_id: 'same-raw-id', output: 'first result',
   }),
-  record(duplicateCallId, 6, 'response_item', {
+  oldRecord(duplicateCallId, 6, 'response_item', {
     type: 'function_call_output', call_id: 'same-raw-id', output: 'second result',
   }),
-  record(duplicateCallId, 7, 'event_msg', { type: 'task_complete' }),
+  oldRecord(duplicateCallId, 7, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 // Completion telemetry can repeat the same malformed raw id too. Keep the
 // ordered event outcomes paired with the renamed calls rather than assigning
 // the last completion to the first call and fabricating an error for the next.
 writeFileSync(oldFileFor('duplicate-event-call-ids'), [
-  record(duplicateEventCallId, 0, 'session_meta', {
+  oldRecord(duplicateEventCallId, 0, 'session_meta', {
     id: duplicateEventCallId, cwd: '/tmp/duplicate-event-call-project', model_provider: 'openai',
     timestamp: now.toISOString(),
   }),
-  record(duplicateEventCallId, 1, 'event_msg', { type: 'task_started' }),
-  record(duplicateEventCallId, 2, 'response_item', {
+  oldRecord(duplicateEventCallId, 1, 'event_msg', { type: 'task_started' }),
+  oldRecord(duplicateEventCallId, 2, 'response_item', {
     type: 'message', role: 'user', content: [{ type: 'input_text', text: 'duplicate event calls' }],
   }),
-  record(duplicateEventCallId, 3, 'response_item', {
+  oldRecord(duplicateEventCallId, 3, 'response_item', {
     type: 'function_call', call_id: 'same-event-raw-id', name: 'first_tool', arguments: '{}',
   }),
-  record(duplicateEventCallId, 4, 'response_item', {
+  oldRecord(duplicateEventCallId, 4, 'response_item', {
     type: 'function_call', call_id: 'same-event-raw-id', name: 'second_tool', arguments: '{}',
   }),
-  record(duplicateEventCallId, 5, 'event_msg', {
+  oldRecord(duplicateEventCallId, 5, 'event_msg', {
     type: 'exec_command_end', call_id: 'same-event-raw-id', output: 'first event result',
   }),
-  record(duplicateEventCallId, 6, 'event_msg', {
+  oldRecord(duplicateEventCallId, 6, 'event_msg', {
     type: 'exec_command_end', call_id: 'same-event-raw-id', output: 'second event result',
   }),
-  record(duplicateEventCallId, 7, 'event_msg', { type: 'task_complete' }),
+  oldRecord(duplicateEventCallId, 7, 'event_msg', { type: 'task_complete' }),
 ].join('\n') + '\n')
 
 // A compaction snapshot can contain two legitimate id-less messages with the
@@ -637,13 +643,67 @@ const repeatedHistory = [
   { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'same history answer' }] },
 ]
 writeFileSync(oldFileFor('repeated-history'), [
-  record(repeatedHistoryId, 0, 'session_meta', {
+  oldRecord(repeatedHistoryId, 0, 'session_meta', {
     id: repeatedHistoryId, cwd: '/tmp/repeated-history-project', model_provider: 'openai',
     timestamp: now.toISOString(),
   }),
-  record(repeatedHistoryId, 1, 'compacted', { replacement_history: repeatedHistory }),
-  record(repeatedHistoryId, 2, 'compacted', { replacement_history: repeatedHistory }),
-  record(repeatedHistoryId, 3, 'event_msg', { type: 'task_complete' }),
+  oldRecord(repeatedHistoryId, 1, 'compacted', { replacement_history: repeatedHistory }),
+  oldRecord(repeatedHistoryId, 2, 'compacted', { replacement_history: repeatedHistory }),
+  oldRecord(repeatedHistoryId, 3, 'event_msg', { type: 'task_complete' }),
+].join('\n') + '\n')
+
+// Codex keeps appending to the rollout of an open conversation, so the file of
+// the conversation a user is in right now can carry a days-old filename
+// timestamp. These fixtures live in their own root: they must be found by
+// activity in a window that their filenames fall outside of, which keeps the
+// baseline inventory above focused on its two freshly created files.
+const liveRoot = join(root, 'codex-live', 'sessions')
+mkdirSync(liveRoot, { recursive: true })
+const localStamp = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  + `T${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+const threeDaysAgo = new Date(now.getTime() - 72 * 3600_000)
+const liveFileFor = (suffix) => join(liveRoot, `rollout-${localStamp(threeDaysAgo)}-${suffix}.jsonl`)
+const liveRootId = '01999999-aaaa-7bbb-8ccc-000000000040'
+const livePageId = '01999999-aaaa-7bbb-8ccc-000000000041'
+const coldRootId = '01999999-aaaa-7bbb-8ccc-000000000042'
+const liveMeta = (id) => record(id, 0, 'session_meta', {
+  id, session_id: id, cwd: '/tmp/live-project', model_provider: 'openai', model: 'codex',
+  history_mode: 'paginated', timestamp: now.toISOString(),
+})
+// Page one stopped three days ago; page two is still being written.
+writeFileSync(liveFileFor(liveRootId), [
+  oldRecord(liveRootId, 0, 'session_meta', {
+    id: liveRootId, session_id: liveRootId, cwd: '/tmp/live-project', model_provider: 'openai',
+    history_mode: 'paginated', timestamp: threeDaysAgo.toISOString(),
+  }, threeDaysAgo.toISOString()),
+  oldRecord(liveRootId, 1, 'event_msg', { type: 'task_started' }, threeDaysAgo.toISOString()),
+  oldRecord(liveRootId, 2, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'live page one' }],
+  }, threeDaysAgo.toISOString()),
+  oldRecord(liveRootId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'live answer one' }],
+  }, threeDaysAgo.toISOString()),
+].join('\n') + '\n')
+writeFileSync(liveFileFor(`${liveRootId}_${livePageId}`), [
+  liveMeta(liveRootId),
+  record(liveRootId, 1, 'event_msg', { type: 'task_started' }),
+  record(liveRootId, 2, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'live page two' }],
+  }),
+  record(liveRootId, 3, 'response_item', {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'live answer two' }],
+  }),
+].join('\n') + '\n')
+// The paginated rollout migration rewrites cold rollouts, which gives a
+// months-old conversation today's mtime; its newest record still says otherwise.
+writeFileSync(liveFileFor(coldRootId), [
+  oldRecord(coldRootId, 0, 'session_meta', {
+    id: coldRootId, session_id: coldRootId, cwd: '/tmp/cold-project', model_provider: 'openai',
+    history_mode: 'paginated', timestamp: threeDaysAgo.toISOString(),
+  }, threeDaysAgo.toISOString()),
+  oldRecord(coldRootId, 1, 'response_item', {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'cold rewritten prompt' }],
+  }, threeDaysAgo.toISOString()),
 ].join('\n') + '\n')
 
 let passed = 0
@@ -1128,11 +1188,11 @@ try {
     const id = '01999999-aaaa-7bbb-8ccc-000000000037'
     const path = oldFileFor('lifecycle-spaces')
     writeFileSync(path, [
-      record(id, 0, 'session_meta', { id, cwd: '/tmp/lifecycle-spaces', model_provider: 'openai', timestamp: now.toISOString() }),
-      record(id, 1, 'event_msg', { type: 'turn start' }),
-      record(id, 2, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'space lifecycle' }] }),
-      record(id, 3, 'response_item', { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] }),
-      record(id, 4, 'event_msg', { type: 'turn ended' }),
+      oldRecord(id, 0, 'session_meta', { id, cwd: '/tmp/lifecycle-spaces', model_provider: 'openai', timestamp: now.toISOString() }),
+      oldRecord(id, 1, 'event_msg', { type: 'turn start' }),
+      oldRecord(id, 2, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'space lifecycle' }] }),
+      oldRecord(id, 3, 'response_item', { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] }),
+      oldRecord(id, 4, 'event_msg', { type: 'turn ended' }),
     ].join('\n') + '\n')
     const out = join(root, 'scratch-lifecycle-spaces')
     const imported = await runImport({ root: out, codexRoot, sessionIds: [id] })
@@ -1236,6 +1296,71 @@ try {
     const link = join(root, 'codex-link')
     symlinkSync(codexRoot, link, 'dir')
     assert.deepEqual(findRollouts(1, link), [])
+  })
+
+  await check('a conversation Codex is still appending to stays inside a recent window', () => {
+    const paths = findRollouts(24, liveRoot).map((file) => file.path)
+    // The live page is the reason the conversation is selected, and the page
+    // that started outside the window has to travel with it: a page file holds
+    // only its own turns.
+    assert.ok(paths.includes(liveFileFor(`${liveRootId}_${livePageId}`)), 'live page must be selected')
+    assert.ok(paths.includes(liveFileFor(liveRootId)), 'the older page must travel with it')
+    assert.equal(paths.some((path) => path.includes(coldRootId)), false, 'a rewritten cold rollout must stay out')
+    const listed = listConversations({ sinceHours: 24, codexRoot: liveRoot })
+    const row = listed.rows.find((entry) => entry.sessionId === liveRootId)
+    assert.equal(row?.segments, 2)
+    assert.equal(row?.prompts, 2)
+    assert.equal(listed.rows.some((entry) => entry.sessionId === coldRootId), false)
+  })
+
+  await check('the activity probe survives a torn tail and a one-record file', () => {
+    const probeRoot = join(root, 'codex-probe', 'sessions')
+    mkdirSync(probeRoot, { recursive: true })
+    const probeFile = (suffix) => join(probeRoot, `rollout-${localStamp(threeDaysAgo)}-${suffix}.jsonl`)
+    const stampNow = now.toISOString()
+    const torn = probeFile('torn-tail')
+    writeFileSync(torn, [
+      record('torn-head', 0, 'session_meta', { id: 'torn-tail', cwd: '/tmp/torn', timestamp: stampNow }),
+      `{"timestamp":"${stampNow}","ordinal":1,"type":"event_msg"`,
+    ].join('\n'))
+    assert.equal(lastRecordTimestamp(torn), Date.parse(stampNow))
+    const single = probeFile('single-record')
+    writeFileSync(single, record('single-head', 0, 'session_meta', {
+      id: 'single-record', cwd: '/tmp/single', timestamp: stampNow,
+    }))
+    assert.equal(lastRecordTimestamp(single), Date.parse(stampNow))
+    // Compressed rollouts are cold: their filename timestamp stands for them.
+    assert.equal(Number.isNaN(lastRecordTimestamp(`${single}.zst`)), true)
+    const listed = listConversations({ sinceHours: 24, codexRoot: probeRoot })
+    assert.deepEqual(listed.rows.map((row) => row.sessionId).sort(), ['single-record', 'torn-tail'])
+  })
+
+  await check('a page id from a paginated filename selects its conversation', async () => {
+    const refs = collectConversationRefs(findRollouts(Number.MAX_SAFE_INTEGER, liveRoot), [livePageId])
+    assert.equal(refs.length, 1)
+    assert.equal(refs[0].sessionId, liveRootId)
+    const out = join(root, 'scratch-live-page')
+    const imported = await runImport({ root: out, codexRoot: liveRoot, sessionIds: [livePageId] })
+    assert.equal(imported.results.length, 1)
+    assert.equal(imported.results[0].id, `session-${liveRootId}`)
+    assert.equal(imported.results[0].segments, 2)
+    const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const body = JSON.stringify(events)
+    assert.match(body, /live page one/)
+    assert.match(body, /live page two/)
+  })
+
+  await check('listing timestamps are rendered in local wall-clock time', () => {
+    const iso = '2026-01-02T03:04:05.000Z'
+    const local = new Date(iso)
+    const part = (value) => String(value).padStart(2, '0')
+    assert.equal(
+      formatLocalMinute(iso),
+      `${local.getFullYear()}-${part(local.getMonth() + 1)}-${part(local.getDate())}`
+        + ` ${part(local.getHours())}:${part(local.getMinutes())}`,
+    )
+    assert.equal(formatLocalMinute('not a timestamp'), '????-??-?? ??:??')
   })
 
   await check('the plugin honours a profile-specific sessions root', () => {

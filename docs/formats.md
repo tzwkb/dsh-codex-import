@@ -137,14 +137,31 @@ conversation root. The importer groups by that root, retains every source id
 for `--session` selection, skips records marked as sub-agent transcripts, and
 folds cumulative duplicate messages before ordering by timestamp and `ordinal`.
 
-**Select by the timestamp in the filename** (`rollout-YYYY-MM-DDTHH-MM-SS-…`),
-never by mtime: Codex rewrites old rollouts, so a stale file can carry today's
-mtime and silently corrupt a "recent sessions" selection.
+**Select by activity, and read that activity from the records.** A rollout is
+selected when it started inside the window or when Codex is still appending to
+it, because one conversation stays open for days: the file behind the chat a
+user is in right now can carry a days-old `rollout-YYYY-MM-DDTHH-MM-SS-…` name.
+The filename timestamp is therefore only half the test. Never trust mtime for
+the other half on its own: the paginated rollout migration rewrites old
+rollouts, so a stale file can carry today's mtime. The newest complete record's
+`timestamp`, read from a bounded tail (256 KiB, widened to 4 MiB for an
+oversized record), is the honest signal — a rewritten cold file still reports
+its original time. Compressed `.jsonl.zst` rollouts are cold by definition,
+because Codex never appends to them, so their filename timestamp stands alone.
+
+**Import every page of a selected conversation.** Codex pages a long rollout
+into `rollout-…-<root>_<page>.jsonl` files, and a page holds only its own
+records; selecting the live page by itself would start the session
+mid-conversation. Selection therefore uses the id *before* the underscore, and
+every file carrying it travels with the conversation. That page id is also a
+`--session` alias: Codex's own stores index pages by it, while the rollout
+metadata never mentions it. An alias only widens matching; it never becomes the
+imported session's id.
 
 **Never take the session id from the filename.** The suffix looks like one and
 matches `session_meta.session_id` for current Codex Desktop builds, but across a
 300-file sample it matched only 8% of the time — older builds put a per-file
-uuid there. The id must come from the record.
+uuid there. The id of the session the importer writes must come from the record.
 
 The importer scans a bounded metadata prefix from each file. It uses the first
 metadata id as the file's own source id, the last lineage/root id when present,
@@ -255,10 +272,13 @@ additional plaintext exists.
 ## Memory and publication safety
 
 Discovery first builds lightweight references containing only each rollout path,
-its filename timestamp, and ids read from a bounded metadata prefix. Conversion
-then loads and releases one conversation at a time. This keeps a multi-gigabyte
-Codex history from becoming one giant in-memory object; `collectConversations`
-remains available for callers that explicitly want the eager API.
+its filename timestamp, and ids read from a bounded metadata prefix. Deciding
+whether a rollout is still live costs one `stat` and a bounded tail read of the
+few files whose mtime is inside the window, so no conversation body is loaded
+during discovery. Conversion then loads and releases one conversation at a time.
+This keeps a multi-gigabyte Codex history from becoming one giant in-memory
+object; `collectConversations` remains available for callers that explicitly
+want the eager API.
 
 The sync path stages a new session beside its destination and renames it into
 place only after the source is complete. Existing destination ancestors and log

@@ -12,7 +12,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 ## What it does
 
-- Groups Codex rollout segments into conversations. One conversation spans several `rollout-*.jsonl` or compressed `rollout-*.jsonl.zst` files; newer files may identify the segment with `payload.id` and the conversation root with the metadata lineage. File mtime is not a recency signal, and the filename suffix is not the session id.
+- Groups Codex rollout segments into conversations. One conversation spans several `rollout-*.jsonl` or compressed `rollout-*.jsonl.zst` files; newer files may identify the segment with `payload.id` and the conversation root with the metadata lineage. The filename suffix is not the session id, and a paginated page names its page only in the filename — which is also accepted by `--session`.
 - Converts each conversation into a DSH session v3 log — turns, steps, messages, tool calls and results, reasoning summaries, and images.
 - Recovers the model's thinking as far as it is recoverable: Codex ships reasoning as a server-keyed Fernet token, and about a third of those records also carry a plaintext `summary` that becomes a `reasoning` block.
 - Admits attached images through the DSH attachment store, so they render in the transcript and reach the model again.
@@ -42,7 +42,7 @@ Inside a `dsh-tui` session:
 ```
 /import-codex --list               # see what is available before importing
 /import-codex                      # lists too — nothing is written without a scope
-/import-codex --since-hours 168    # last week
+/import-codex --since-hours 168    # conversations active in the last week
 /import-codex --session <id>       # one Codex session id (repeatable)
 /import-codex --limit 10           # newest 10 after filtering
 /import-codex --project /repo      # this project and its descendants
@@ -55,7 +55,7 @@ Inside a `dsh-tui` session:
 /import-codex --help
 ```
 
-A bare invocation lists rather than importing everything in range, because the scope should be chosen deliberately. The list prints each conversation with its full session id, time span, working directory, and opening prompt. The window is selected by the timestamp **in the filename**, never by mtime — Codex rewrites old rollouts, so a months-old file can carry today's mtime.
+A bare invocation lists rather than importing everything in range, because the scope should be chosen deliberately. The list prints each conversation with its full session id, time span in local time, working directory, and opening prompt. `--since-hours N` selects conversations with **activity** in that window: one that started inside it, or one Codex is still appending to. Codex keeps a conversation open for days, so the file behind the chat you are in right now can carry a days-old name — the filename timestamp alone would hide it. Activity is proven by the timestamp of the newest record in the file, never by mtime alone, because the paginated rollout migration rewrites cold rollouts and gives a months-old file today's mtime. Every page of a selected conversation is imported: a page file holds only its own turns, so importing the live page by itself would truncate the session.
 
 The same work is available from a shell, without a running harness:
 
@@ -134,7 +134,7 @@ scripts/reinstall.sh          # re-copies into the dsh-tui profile, then restart
 
 `scripts/reinstall.sh <profile>` targets another profile. Re-running `dsh plugin add` refreshes an existing `file:` dependency in place; removing first is not required.
 
-Tests use a synthetic Codex corpus and a throwaway `DSH_HOME` under `.test-work`, so they never read your personal history. Verification loads the lockfile-pinned DSH runtime into `.test-runtime`; no global DSH, `~/.dsh`, or `~/.codex` data is touched. The deterministic regression suite also covers malformed input, zstd magic collisions, bounded discovery, dry-run side effects, rollback history, and symlink guards:
+Tests use a synthetic Codex corpus and a throwaway `DSH_HOME` under `.test-work`, so they never read your personal history. Verification loads the lockfile-pinned DSH runtime into `.test-runtime`; no global DSH, `~/.dsh`, or `~/.codex` data is touched. The deterministic regression suite also covers malformed input, zstd magic collisions, bounded discovery, live-rollout window selection, dry-run side effects, rollback history, and symlink guards:
 
 ```sh
 npm run test:setup     # once per clone: download the isolated DSH test runtime

@@ -17,7 +17,7 @@
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { runImport, listConversations } from '../lib/convert.js'
+import { runImport, listConversations, formatLocalMinute } from '../lib/convert.js'
 import { verifyPaths } from '../lib/verify.js'
 import { assertSafeRoot, syncSessions, writeManifest, manifestPath, readState, rollbackManifest } from '../lib/sync.js'
 import { openAttachmentStore, resolveDshHome } from '../lib/store.js'
@@ -40,7 +40,7 @@ Commands:
 
 Selection and paths:
   --session ID          import one Codex session (repeatable)
-  --since-hours N       select rollouts from the last N hours (default 24)
+  --since-hours N       select conversations active in the last N hours (default 24)
   --limit N              keep the newest N conversations after filtering
   --project DIR          restrict imports to this project path (or descendants)
   --archived             include $CODEX_HOME/archived_sessions
@@ -228,14 +228,14 @@ async function main() {
       includeArchived: opts.includeArchived, project: opts.project,
     })
     if (rows.length === 0) {
-      console.log(`no conversations started in the last ${opts.sinceHours} h (scanned ${rollouts} rollout files)`)
+      console.log(`no conversations active in the last ${opts.sinceHours} h (scanned ${rollouts} rollout files)`)
       return 1
     }
     console.log(`${rows.length} conversation(s) from ${rollouts} rollout file(s), newest first:\n`)
-    console.log('started           last              seg  msgs  session id                              cwd')
+    console.log('started (local)   last (local)      seg  msgs  session id                              cwd')
     for (const row of [...rows].reverse()) {
       console.log(
-        `${row.startedAt.slice(0, 16).replace('T', ' ')}  ${row.lastAt.slice(0, 16).replace('T', ' ')}  `
+        `${formatLocalMinute(row.startedAt)}  ${formatLocalMinute(row.lastAt)}  `
         + `${String(row.segments).padStart(3)} ${String(row.prompts).padStart(5)}  ${row.sessionId}  ${row.cwd}`,
       )
       if (row.prompt.length > 0) console.log(`                                                          “${row.prompt}”`)

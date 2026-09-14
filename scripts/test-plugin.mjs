@@ -83,7 +83,7 @@ try {
   const listed = await command.handler({ rawInput: '' })
   check('a bare invocation lists instead of importing', () => {
     assert.equal(listed.kind, 'success')
-    assert.match(listed.text, /conversation\(s\) in the last 24 h|No conversations started in the last 24 h/)
+    assert.match(listed.text, /conversation\(s\) active in the last 24 h|No conversations active in the last 24 h/)
     assert.equal(existsSync(root), false, 'listing created the sessions root')
   })
 

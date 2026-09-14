@@ -12,7 +12,7 @@
 
 ## 它做什么
 
-- **按会话归并 rollout 分段。** 一个对话可能拆成多个 `rollout-*.jsonl` 或压缩的 `rollout-*.jsonl.zst`；新版文件用 `payload.id` 标识分段，再由元数据 lineage 找到根会话。文件 mtime 不能代表对话时间，文件名后缀也不等于 session id。
+- **按会话归并 rollout 分段。** 一个对话可能拆成多个 `rollout-*.jsonl` 或压缩的 `rollout-*.jsonl.zst`；新版文件用 `payload.id` 标识分段，再由元数据 lineage 找到根会话。文件名后缀不等于 session id，而分页（paginated）文件只在文件名里写出分页 id —— 该 id 同样可以被 `--session` 接受。
 - **转换成 DSH session v3 会话日志** —— turn、step、消息、工具调用与结果、思考摘要、图片。
 - **尽可能还原思考过程。** Codex 把 reasoning 存成服务端密钥的 Fernet 令牌，但其中约三分之一的记录另带明文 `summary`，会被转成 `reasoning` 块。
 - **把附图接入 DSH 附件库**，使其能在会话记录里渲染，也能重新送到模型面前。
@@ -42,7 +42,7 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 ```
 /import-codex --list               # 先看有什么，再决定导什么
 /import-codex                      # 同样是列出 —— 不给范围就不写入
-/import-codex --since-hours 168    # 最近一周
+/import-codex --since-hours 168    # 最近一周内有活动的对话
 /import-codex --session <id>       # 指定某个 Codex session id（可重复）
 /import-codex --limit 10           # 筛选后取最新 10 个
 /import-codex --project /repo      # 只导入该项目及其子目录
@@ -55,7 +55,7 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 /import-codex --help
 ```
 
-裸敲 `/import-codex` 是**列出**而不是全量导入 —— 范围应该由人来定。列表会给出每个对话的完整 session id、时间跨度、工作目录和开场提问。时间窗按**文件名里的时间戳**选取，而不是 mtime —— Codex 会回写旧 rollout，几个月前的文件也可能带着今天的 mtime。
+裸敲 `/import-codex` 是**列出**而不是全量导入 —— 范围应该由人来定。列表会给出每个对话的完整 session id、时间跨度（本地时间）、工作目录和开场提问。`--since-hours N` 选的是这段时间内**有活动**的对话：在此期间开始的，或者 Codex 仍在追加写入的。Codex 的一个对话可以连续开好几天，所以「你此刻正在用的那个对话」对应的文件，文件名可能是几天前的 —— 只看文件名时间戳就会把它漏掉。是否有活动以文件里**最后一条记录的时间戳**为准，而不是只看 mtime —— 分页 rollout 迁移会回写冷文件，让几个月前的文件带上今天的 mtime。被选中的对话会导入**全部分页**：分页文件只包含自己那一段，只导当前分页会截断会话。
 
 同样的能力也可以脱离 harness，直接在 shell 里用：
 
@@ -129,7 +129,7 @@ scripts/reinstall.sh          # 重新拷贝进 dsh-tui profile，然后重启 d
 
 `scripts/reinstall.sh <profile>` 可指定其他 profile。重复执行 `dsh plugin add` 会原地刷新已有的 `file:` 依赖，不需要先 remove。
 
-测试使用项目 `.test-work` 下生成的合成 Codex 语料和一次性的 `DSH_HOME`，不会读取你的个人历史。校验器使用按 lockfile 固定依赖树、下载到 `.test-runtime` 的 DSH 运行时，不会调用全局 DSH，也不会碰 `~/.dsh` 或 `~/.codex`。确定性回归套件覆盖损坏输入、zstd 魔数冲突、低内存扫描、dry-run 副作用、回滚历史和软链接防护：
+测试使用项目 `.test-work` 下生成的合成 Codex 语料和一次性的 `DSH_HOME`，不会读取你的个人历史。校验器使用按 lockfile 固定依赖树、下载到 `.test-runtime` 的 DSH 运行时，不会调用全局 DSH，也不会碰 `~/.dsh` 或 `~/.codex`。确定性回归套件覆盖损坏输入、zstd 魔数冲突、低内存扫描、活跃 rollout 的时间窗选取、dry-run 副作用、回滚历史和软链接防护：
 
 ```sh
 npm run test:setup     # 每个 clone 只需执行一次：下载隔离的 DSH 测试运行时
