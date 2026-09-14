@@ -240,8 +240,9 @@ async function main() {
       )
       if (row.prompt.length > 0) console.log(`                                                          “${row.prompt}”`)
     }
-    console.log('\nImport one with:  import-codex sync --session <session id>')
-    console.log(`Import the window: import-codex sync --since-hours ${opts.sinceHours}`)
+    console.log('\nNothing was imported yet — this command only lists until you pick a scope:')
+    console.log('Import one:    import-codex sync --session <session id>')
+    console.log(`Import all ${rows.length}: import-codex sync --since-hours ${opts.sinceHours}`)
     return 0
   }
 
