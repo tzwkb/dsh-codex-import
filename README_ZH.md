@@ -13,6 +13,8 @@
 ## 它做什么
 
 - **按会话归并 rollout 分段。** 一个对话可能拆成多个 `rollout-*.jsonl` 或压缩的 `rollout-*.jsonl.zst`；新版文件用 `payload.id` 标识分段，再由元数据 lineage 找到根会话。文件名后缀不等于 session id，而分页（paginated）文件只在文件名里写出分页 id —— 该 id 同样可以被 `--session` 接受。
+- **默认只导入 Codex 当前的压缩窗口**，而不是把 rollout 全量回放一遍 —— 见下面「为什么默认不是全量回放」。
+- **每条文本有独立长度上限**（默认 262144 字符），超长文本保留头尾并留下明确的截断标记：单条超大消息是压缩唯一救不回来的形状，所以在导入时就地处理。
 - **转换成 DSH session v3 会话日志** —— turn、step、消息、工具调用与结果、思考摘要、图片。
 - **尽可能还原思考过程。** Codex 把 reasoning 存成服务端密钥的 Fernet 令牌，但其中约三分之一的记录另带明文 `summary`，会被转成 `reasoning` 块。
 - **把附图接入 DSH 附件库**，使其能在会话记录里渲染，也能重新送到模型面前。
@@ -42,6 +44,7 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 ```
 /import-codex --list               # 先看有什么，再决定导什么
 /import-codex                      # 同样是列出 —— 不给范围就不写入
+/import-codex --audit              # 量一遍已装会话，点名压不动的历史
 /import-codex --since-hours 168    # 最近一周内有活动的对话
 /import-codex --session <id>       # 指定某个 Codex session id（可重复）
 /import-codex --limit 10           # 筛选后取最新 10 个
@@ -49,6 +52,8 @@ pnpm 的 `file:` 协议会把包**拷贝**进 profile 而不是建软链，因�
 /import-codex --archived           # 包含 Codex 归档会话
 /import-codex --codex-root /backup/codex/sessions  # 指定另一个来源
 /import-codex --max-tool-output 4000  # 换取更小的会话（代价是细节减少）
+/import-codex --max-text-chars 65536  # 单条文本上限（默认 262144，0 = 不限）
+/import-codex --full-history       # 全量回放（只适合放得进一个上下文的对话）
 /import-codex --no-images          # 跳过附件库图片写入
 /import-codex --dry-run            # 只转换并校验，不写入
 /import-codex --force              # 连你在 DSH 里继续过的会话也刷新（破坏性）
@@ -64,6 +69,7 @@ node bin/import-codex.mjs list    --since-hours 168
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check
 node bin/import-codex.mjs sync    --codex-root /backup/codex/sessions --dsh-home /tmp/dsh --dry-run
 node bin/import-codex.mjs verify  /tmp/import-check
+node bin/import-codex.mjs audit   ~/.dsh/sessions   # 只读：哪些已装会话压不动
 node bin/import-codex.mjs sync    --since-hours 24      # 进入 $DSH_TUI_SESSION_ROOT 或 $DSH_HOME/sessions
 node bin/import-codex.mjs rollback --manifest /path/to/codex-import-manifests/<run>.json
 ```
@@ -85,11 +91,46 @@ node bin/import-codex.mjs rollback --manifest /path/to/codex-import-manifests/<r
 
 导入运行本身不会删除会话，也不会把一个对话导入两次：刷新是替换文件，目录、目录里的其他文件、以及 session id 都保留。只有显式执行回滚命令时，才会移除本次导入新建的会话。
 
+## 为什么默认不是全量回放
+
+一个 rollout 是**只追加**的日志，但 Codex 并不回放它：每写一条 `compacted` 记录，它就把此前的历史替换成自己带的那份摘要。所以「把 rollout 全部导入」等于把模型**再也看不到的历史**一起导入，而长对话可以比它当前窗口大好几百倍 —— 实测一个 464 MB 的 rollout，全量回放是约 824 万 token，而 Codex 当前窗口只有约 13 万 token。
+
+这不只是体积问题。DSH 的压缩（自动的与 `/compact`）要**把待压缩的那段历史重放给摘要模型**，所以：
+
+- 历史超过模型上下文 → 请求发不出去；
+- 想压缩 → 摘要那一步同样超上下文，一样失败。
+
+结果是会话能列出来、能 resume，却拒绝每一个新回合，而且手动压缩也救不回来。默认的窗口导入就是为此存在的：**取最后一条 `compacted` 记录 + 它之后的全部记录**，也就是 Codex 自己此刻仍持有的上下文。更早的快照被丢弃，因为最后那条已经把它们摘要过了；对话级元数据（cwd、模型、创建时间、标题）仍从完整记录里读，不受窗口影响。
+
+`--full-history` 保留旧的全量回放行为，适合确实需要完整过程、并且放得进一个上下文的对话。
+
+`--max-text-chars N`（默认 262144）是另一道闸：**单条**超大文本是压缩唯一修不了的形状 —— 平衡压缩不会切开一个不可分的单元，pruner 也只裁工具输出。超过上限的文本保留头部与尾部，中间换成带字符数的显式标记，所以损失从不静默。
+
+## 已经导入的超大会话怎么办
+
+`--audit` 是只读的：它量出每个已装会话的模型上下文规模，点名超过建议上限（约 700k token）的那些，绝不改写、绝不跟随软链接。
+
+```
+/import-codex --audit
+node bin/import-codex.mjs audit ~/.dsh/sessions
+```
+
+修法是**从 Codex 那边重建**（源数据在 Codex 里是完好的）：
+
+```
+/import-codex --session <codex session id> --force
+node bin/import-codex.mjs sync --session <id> --force
+```
+
+`--force` 是必需的，因为已装的日志已经不是导入器写下的那两帧了；它只替换那一个会话日志，Codex 的 rollout 永不改动。会话 id 与目录都不变，所以 `/resume` 列表和工作区状态继续有效。重建后的会话应当重新出现在 `--audit` 的「无超限」一侧。
+
 ## 保留什么，丢弃什么
 
 | | 结果 |
 | --- | --- |
 | 消息、工具调用与结果 | **完整导入**，包括普通 `response_item` 缺失时可从 `item_completed` telemetry 恢复的可读消息。若需要更小的会话，可用 `--max-tool-output N` 把每条工具输出截断到 N 字符；默认 0，即全部保留。缺失的调用或结果会补成明确占位并计入报告，非零退出会保留错误标记。 |
+| Codex 压缩窗口之外的历史 | **默认不导入**（`--full-history` 可恢复全量回放）。它已经被 Codex 自己的检查点摘要，模型在 Codex 里也看不到它。 |
+| 单条超长文本 | 超过 `--max-text-chars`（默认 262144 字符）时保留头尾，中间换成 `[... N of M chars trimmed during Codex import ...]`。 |
 | 思维链 | 只有明文 `summary`，覆盖率约三分之一。其余是 OpenAI 服务端密钥的 Fernet 令牌，任何客户端都读不了。 |
 | 图片 | **会导入**，经附件库，兼容 App Server、telemetry 侧用户图片和结构化图片生成结果。过大或格式错误的 base64 会在分配内存前拒绝；附件库实际拒绝会明确报告，正文会保留明确的“图片未附加”占位。 |
 | Codex 注入的上下文 | 丢弃。但 `# Files mentioned by the user:` 是**拆壳**而非丢弃 —— 它内部裹着真人的原始提问。 |
@@ -142,6 +183,13 @@ node scripts/test-sync.mjs --keep     # 保留临时目录以便排查
 `test-sync.mjs` 覆盖确定性、安装、无变化重跑、原地刷新、两种拒绝、`--force` 与图片保护；`test-plugin.mjs` 按 harness 的方式组装插件并真正调用命令处理器 —— 斜杠命令才是实际使用的入口，其他测试都到不了那里。
 
 改动 `lib/convert.js` 或 `lib/verify.js` 之前，请先读 [`docs/formats.md`](docs/formats.md)。`DSH_CODEX_IMPORT_SELFTEST=<path>` 会让插件把命令注册结果写进文件 —— 这是唯一无头确认命令已注册的办法，因为 `dsh-acp` 不解析斜杠命令，`acp` profile 也不会加载其他 profile 的 bundle。
+
+`scripts/test-resume.mjs <sessions-root> [session-id] [dsh-home]` 会把一个**真实**会话交给隔离的 `acp` profile 去 list + resume，用来验证一个具体转换结果确实能被 harness 读起来（`DSH_HOME` 必须是 profile 解析出的那个 home，否则列出来是空的）：
+
+```sh
+DSH_HOME=/tmp/acp-home DSH_TUI_SESSION_ROOT=/tmp/acp-home/sessions \
+  node scripts/test-resume.mjs /tmp/acp-home/sessions
+```
 
 ## 许可证
 

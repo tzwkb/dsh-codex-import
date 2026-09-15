@@ -137,6 +137,22 @@ conversation root. The importer groups by that root, retains every source id
 for `--session` selection, skips records marked as sub-agent transcripts, and
 folds cumulative duplicate messages before ordering by timestamp and `ordinal`.
 
+**A rollout is a log, not the context.** Codex appends every turn it ever took,
+then writes a `compacted` record whose `replacement_history` is the conversation
+as it stood at that point. The model only ever saw the newest such window, so a
+conversion that replays the whole log imports history the model could not see —
+and, worse, produces a DSH session that can be neither sent nor compacted, since
+condensing a span means replaying that span to a summarizer. The default
+conversion therefore starts at the last `compacted` record. Only records before
+it are dropped, and only those: the checkpoint itself carries summarised
+messages that exist nowhere else, which is why the record is kept rather than
+consumed. `--full-history` restores the whole replay.
+
+Conversation-level metadata is read from the **full** record list, never from
+the window: `session_meta` and `turn_context` sit at the head of a rollout, so a
+window that starts later would otherwise lose the cwd, the model, and the
+created time. `prepareRecords` returns both lists for exactly this reason.
+
 **Select by activity, and read that activity from the records.** A rollout is
 selected when it started inside the window or when Codex is still appending to
 it, because one conversation stays open for days: the file behind the chat a
@@ -302,18 +318,33 @@ import manifest unchanged.
   each output to N chars when smaller sessions matter more than completeness.
   A truncated output ends with an explicit `[... truncated X of Y chars ...]`
   marker, so the loss is never silent.
+- A single text is bounded by `--max-text-chars` (default 262,144). This is the
+  one limit the harness cannot enforce later: balanced summary compaction will
+  not split an indivisible unit, and the tool-result pruner only rewrites tool
+  results, so an oversized user message or reasoning block survives every repair
+  path. Clamping keeps the head and the tail around an explicit
+  `[... N of M chars trimmed during Codex import ...]` marker. `0` disables it.
 - A `compacted` record's `replacement_history` is a recovery source, not
   context plumbing. Most of it repeats messages the log still holds, but some
   exists nowhere else; dropping the record whole loses real turns. Messages are
   matched per conversation by id (falling back to role + body) so the repeats
   are skipped, and the remainder is emitted at the compaction's own position.
   Compaction histories carry only text and images — never tool calls — so
-  inserting them cannot orphan a tool result.
+  inserting them cannot orphan a tool result. Under the default window the last
+  such record is the boundary rather than one merge in a series: the records
+  before it are gone, and its own snapshot becomes the head of the session.
 - Imported sessions record `workspace-write` / `ask` rather than Codex's
   original sandbox: the records are informational and the resuming harness
   applies its own policy.
 - Codex tool names (`exec`, `shell`, …) do not exist in DSH. They are preserved
   verbatim as history the model can read, not as callable tools.
+- Every conversion reports an estimate of the model context it produced, priced
+  with the harness's own heuristic (4 chars/token, +4 per block, +4 per
+  message) over the events the surface still exposes — a `replace` writer
+  shadows what it replaces, so a compacted log is priced as the model sees it.
+  `lib/session-audit.js` applies the same fold to logs that are already
+  installed, which is how `/import-codex --audit` finds sessions that can no
+  longer be compacted.
 
 ## Verification recipe
 
@@ -321,7 +352,13 @@ import manifest unchanged.
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check --dry-run
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check
 node bin/import-codex.mjs verify /tmp/import-check
+node bin/import-codex.mjs audit /tmp/import-check   # price the model context it produced
 ```
+
+`audit` needs no harness and no live root: it decodes each log, folds the
+surface, and prices it. Run it on a conversion output before installing, and on
+`$DSH_HOME/sessions` afterwards to find sessions that are already too large to
+compact.
 
 `verify` runs checks 1–5 and refuses to report success for an empty selection.
 Passing it proves a log is well-formed — not that the harness can continue it.
@@ -331,6 +368,11 @@ only headless surface for it (`dsh --profile acp`, JSON-RPC over stdio):
 ```
 initialize → session/list → session/resume → session/prompt → session/close
 ```
+
+`scripts/test-resume.mjs <sessions-root> [session-id] [dsh-home]` performs
+list → resume → close against one real session, which is enough to prove the
+harness can load it. Its `DSH_HOME` must be the home the profile resolves —
+`session/list` reads that store, so a fresh temporary home lists nothing.
 
 A successful prompt returns `stopReason: end_turn`; the assistant text arrives
 as streamed `session/update` notifications rather than in the result payload, so

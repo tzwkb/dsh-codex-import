@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-import",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DeepSeek Harness plugin: import Codex CLI/Desktop conversations as resumable dsh-tui sessions.",
   "type": "module",
   "license": "MIT",
@@ -35,7 +35,9 @@
     "./verify": "./lib/verify.js",
     "./package.json": "./package.json",
     "./sync": "./lib/sync.js",
-    "./store": "./lib/store.js"
+    "./store": "./lib/store.js",
+    "./tokens": "./lib/session-tokens.js",
+    "./audit": "./lib/session-audit.js"
   },
   "files": [
     "lib",
@@ -59,6 +61,7 @@
     "test:sync": "node scripts/test-sync.mjs",
     "test:plugin": "node scripts/test-plugin.mjs",
     "test:acp": "node scripts/test-acp.mjs",
-    "list": "node bin/import-codex.mjs list"
+    "list": "node bin/import-codex.mjs list",
+    "audit": "node bin/import-codex.mjs audit"
   }
 }

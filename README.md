@@ -14,6 +14,8 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 - Groups Codex rollout segments into conversations. One conversation spans several `rollout-*.jsonl` or compressed `rollout-*.jsonl.zst` files; newer files may identify the segment with `payload.id` and the conversation root with the metadata lineage. The filename suffix is not the session id, and a paginated page names its page only in the filename — which is also accepted by `--session`.
 - Converts each conversation into a DSH session v3 log — turns, steps, messages, tool calls and results, reasoning summaries, and images.
+- Imports **Codex's current compaction window by default** rather than replaying the whole rollout — see [Why the default is not a full replay](#why-the-default-is-not-a-full-replay).
+- Bounds every single text (default 262,144 characters), keeping head and tail around an explicit marker: one oversized unit is the one shape compaction cannot repair, so it is handled at import time.
 - Recovers the model's thinking as far as it is recoverable: Codex ships reasoning as a server-keyed Fernet token, and about a third of those records also carry a plaintext `summary` that becomes a `reasoning` block.
 - Admits attached images through the DSH attachment store, so they render in the transcript and reach the model again.
 - Drops Codex's own context injection (`<recommended_plugins>`, `<environment_context>`, `<permissions instructions>`, IDE/application envelopes, `# AGENTS.md instructions`, …), while unwrapping the human section when an envelope contains `## My request for Codex:`.
@@ -49,6 +51,8 @@ Inside a `dsh-tui` session:
 /import-codex --archived           # include archived Codex sessions
 /import-codex --codex-root /backup/codex/sessions  # alternate source
 /import-codex --max-tool-output 4000  # smaller sessions, at the cost of detail
+/import-codex --max-text-chars 65536  # per-text budget (default 262144; 0 disables)
+/import-codex --full-history       # replay everything; only fits one context if small
 /import-codex --no-images          # skip attachment admission
 /import-codex --dry-run            # convert and verify, write nothing
 /import-codex --force              # refresh even a session you continued in DSH
@@ -64,6 +68,7 @@ node bin/import-codex.mjs list    --since-hours 168
 node bin/import-codex.mjs convert --since-hours 24 --out /tmp/import-check
 node bin/import-codex.mjs sync    --codex-root /backup/codex/sessions --dsh-home /tmp/dsh --dry-run
 node bin/import-codex.mjs verify  /tmp/import-check
+node bin/import-codex.mjs audit   ~/.dsh/sessions   # read-only: what cannot be compacted
 node bin/import-codex.mjs sync    --since-hours 24      # into $DSH_TUI_SESSION_ROOT or $DSH_HOME/sessions
 node bin/import-codex.mjs rollback --manifest /path/to/codex-import-manifests/<run>.json
 ```
@@ -84,6 +89,39 @@ Importing the same conversation again is safe, and cheap when nothing changed. E
 The last case matters most. DSH appends one zstd frame per event batch, so a session you have continued inside DSH is no longer a two-frame log; rewriting it would delete your turns. A log at two frames whose digest does not match what the importer recorded is one something else rewrote, and is treated the same way. `--force` overrides this, and is destructive by design. A conversion that could not reach the attachment store is also refused rather than allowed to overwrite a log that holds images. A sync writes `codex-import-state.json` beside the sessions root; runs that install or refresh sessions also keep a run-specific JSON manifest under `codex-import-manifests/`. A no-op run preserves the previous manifest and its rollback history, while the text manifest remains only for older scripts.
 
 An import run never deletes a session or imports one twice: a refresh replaces the file, keeping the directory, any sibling files, and the session id. The explicit rollback command is the one operation that removes a session created by that import.
+
+## Why the default is not a full replay
+
+A rollout is an append-only log, but Codex does not replay it: every `compacted` record replaces the history before it with the summary the record carries. Importing the whole rollout therefore imports history **the model can no longer see**, and a long conversation is easily hundreds of times larger than its own current window — one measured 464 MB rollout replays to about 8.24M tokens against a current Codex window of about 130k.
+
+Size is not the whole problem. DSH condenses history by **replaying the span being condensed to a summarizer**, so once a history exceeds the model window:
+
+- the request cannot be sent, and
+- the repair cannot run either, because the summarization call is over the same window.
+
+The session lists, resumes, and then refuses every new turn — and manual compaction cannot rescue it. The default window import exists for that: **the last `compacted` record plus every record after it**, which is the context Codex itself still holds. Earlier snapshots are dropped because the last one summarised them. Conversation metadata (cwd, model, createdAt, title) is still read from the full record list, so a window never loses it.
+
+`--full-history` keeps the old whole-replay behaviour for conversations that genuinely fit one context.
+
+`--max-text-chars N` (default 262,144) is the second guard: a single oversized text is the one shape balanced compaction refuses to split and the tool-result pruner cannot touch. Text beyond the budget keeps its head and tail around `[... N of M chars trimmed during Codex import ...]`, so nothing is lost silently.
+
+## An oversized session is already installed
+
+`--audit` is read-only. It prices the model context of every installed session, names the ones above the advisory (~700k tokens), never rewrites, and never follows a symlink.
+
+```
+/import-codex --audit
+node bin/import-codex.mjs audit ~/.dsh/sessions
+```
+
+The fix is to rebuild it **from Codex**, where the source conversation is intact:
+
+```
+/import-codex --session <codex session id> --force
+node bin/import-codex.mjs sync --session <id> --force
+```
+
+`--force` is required because the installed log is no longer exactly what the importer wrote. It replaces that one session log; the Codex rollout is never modified. The session id and directory stay the same, so `/resume` and workspace state keep working. The rebuilt session should then appear on the clear side of the next `--audit`.
 
 ## What survives, and what does not
 
@@ -143,6 +181,13 @@ node scripts/test-sync.mjs --keep     # leave the scratch tree for inspection
 ```
 
 GitHub Actions runs the same suite, syntax checks, and a publish-content audit on both Ubuntu and macOS, using the minimum supported Node 22.19 and the current Node 24 line, for every push to `main` and every pull request.
+
+`scripts/test-resume.mjs <sessions-root> [session-id] [dsh-home]` hands one **real** session to the isolated `acp` profile to list and resume, which is how a specific conversion is proven loadable by the harness (`DSH_HOME` must be the home the profile resolves, or the list comes back empty):
+
+```sh
+DSH_HOME=/tmp/acp-home DSH_TUI_SESSION_ROOT=/tmp/acp-home/sessions \
+  node scripts/test-resume.mjs /tmp/acp-home/sessions
+```
 
 `test-sync.mjs` covers determinism, install, no-op re-sync, in-place refresh, both refusal cases, `--force`, and the image guard. `test-plugin.mjs` composes the plugin the way the harness does and invokes the handler, because the slash command is the surface that actually gets used and no other test reaches it.
 

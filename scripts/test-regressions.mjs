@@ -27,6 +27,7 @@ import { customToolArguments, outputIsError, outputText } from '../lib/codex-pay
 import { decodeDataUrl, generatedImageOf, MAX_IMAGE_BYTES } from '../lib/codex-images.js'
 import { itemFailed, userText } from '../lib/codex-message.js'
 import { isSubagentMetadata, projectMatches, readRecords, lastRecordTimestamp } from '../lib/codex-discovery.js'
+import { auditSessionsRoot, CONTEXT_ADVISORY_TOKENS } from '../lib/session-audit.js'
 import { makeTestRoot, cleanTestRoot } from './test-env.mjs'
 
 const root = makeTestRoot('codex-regression')
@@ -1111,7 +1112,11 @@ try {
 
   await check('case and separator aliases plus replacementHistory remain importable', async () => {
     const out = join(root, 'scratch-alias-schema')
-    const imported = await runImport({ root: out, codexRoot, sessionIds: [aliasSchemaId] })
+    // The alias schema is a full-replay contract: every alias, including the
+    // `replacementHistory` snapshot, has to survive conversion. The default
+    // import deliberately narrows that replay, so this assertion opts into the
+    // complete history the way `--full-history` does.
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [aliasSchemaId], fullHistory: true })
     assert.equal(imported.results.length, 1)
     const events = decodeFrames(readFileSync(join(imported.results[0].dir, 'session.v3.jsonl.zstd')))
       .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
@@ -1121,6 +1126,156 @@ try {
     assert.ok(events.some((event) => JSON.stringify(event).includes('uppercase history prompt')))
     const verified = await verifyPaths([out], { quiet: true })
     assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
+  await check('the default import keeps only Codex\'s current compaction window', async () => {
+    const out = join(root, 'scratch-alias-window')
+    const imported = await runImport({ root: out, codexRoot, sessionIds: [aliasSchemaId] })
+    const result = imported.results[0]
+    assert.equal(result.stats.historyWindow, true, 'the fixture compacted, so a window applies')
+    assert.ok(result.stats.windowDroppedRecords > 0, 'the window drops the replayed prefix')
+    const events = decodeFrames(readFileSync(join(result.dir, 'session.v3.jsonl.zstd')))
+      .slice(1).join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const text = JSON.stringify(events)
+    // What Codex still had in context: the checkpoint's own messages.
+    assert.ok(text.includes('uppercase history prompt'))
+    // What Codex had already compacted away: the prefix records.
+    assert.ok(!text.includes('uppercase user message'))
+    assert.ok(!text.includes('alias command output'))
+    assert.ok(!text.includes('uppercase agent answer'))
+    // Conversation metadata lives in the dropped prefix and must survive anyway.
+    assert.equal(result.cwd, '/tmp/alias-schema-project')
+    const verified = await verifyPaths([out], { quiet: true })
+    assert.equal(verified.failed, 0, verified.failures.map((f) => f.message).join('; '))
+  })
+
+  await check('a compaction window prices below the full replay it replaces', async () => {
+    const out = join(root, 'scratch-alias-sizes')
+    const windowed = await runImport({ root: join(out, 'window'), codexRoot, sessionIds: [aliasSchemaId] })
+    const full = await runImport({ root: join(out, 'full'), codexRoot, sessionIds: [aliasSchemaId], fullHistory: true })
+    assert.ok(windowed.results[0].estimatedTokens <= full.results[0].estimatedTokens)
+    assert.ok(windowed.results[0].surfaceNodes < full.results[0].surfaceNodes)
+  })
+
+  await check('an oversized single text is clamped with an explicit marker', async () => {
+    const id = '01999999-aaaa-7bbb-8ccc-000000000033'
+    const ts = now.toISOString()
+    const huge = `HEAD-${'h'.repeat(500)}-TAIL`
+    const parsed = (ordinal, type, payload) => JSON.parse(record(id, ordinal, type, payload, ts))
+    const segments = [{ records: [
+      parsed(0, 'session_meta', { id, cwd: '/tmp/clamp-project', timestamp: ts }),
+      parsed(1, 'event_msg', { type: 'task_started' }),
+      parsed(2, 'response_item', {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: huge }],
+      }),
+      parsed(3, 'response_item', {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'clamped ok' }],
+      }),
+      parsed(4, 'event_msg', { type: 'task_complete' }),
+    ] }]
+    const built = buildRecords(segments, id, { maxTextChars: 100 })
+    const text = built.records.find((entry) => entry.type === 'user/message').data.content[0].text
+    assert.equal(built.stats.textClamped, 1)
+    assert.ok(text.length < huge.length, 'the text really shrank')
+    assert.ok(text.startsWith('HEAD-'), 'the head names the instruction')
+    assert.ok(text.endsWith('-TAIL'), 'the tail keeps the conclusion')
+    assert.match(text, /trimmed during Codex import/)
+    // The same conversion without a budget is a byte-identical passthrough.
+    const unclamped = buildRecords(segments, id, { maxTextChars: 0 })
+    assert.equal(unclamped.stats.textClamped, 0)
+    assert.equal(unclamped.records.find((entry) => entry.type === 'user/message').data.content[0].text, huge)
+  })
+
+  await check('the audit flags a history too large to compact and clears a small one', async () => {
+    const id = '01999999-aaaa-7bbb-8ccc-000000000035'
+    const ts = now.toISOString()
+    const parsed = (ordinal, type, payload) => JSON.parse(record(id, ordinal, type, payload, ts))
+    const segments = [{ records: [
+      parsed(0, 'session_meta', { id, cwd: '/tmp/audit-project', timestamp: ts }),
+      parsed(1, 'event_msg', { type: 'task_started' }),
+      parsed(2, 'response_item', {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'audit prompt' }],
+      }),
+      parsed(3, 'response_item', {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'audit answer' }],
+      }),
+      parsed(4, 'event_msg', { type: 'task_complete' }),
+    ] }]
+    const auditRoot = join(root, 'scratch-audit')
+    const small = buildRecords(segments, id)
+    const smallDir = sessionDirFor(small, auditRoot)
+    mkdirSync(smallDir, { recursive: true })
+    writeFileSync(join(smallDir, 'session.v3.jsonl.zstd'), serializeSession(small))
+
+    // A second log with a history far beyond any window, built the same way the
+    // oversized import is: one enormous retained message.
+    const hugeId = '01999999-aaaa-7bbb-8ccc-000000000036'
+    const huge = buildRecords([{ records: [
+      JSON.parse(record(hugeId, 0, 'session_meta', { id: hugeId, cwd: '/tmp/audit-project', timestamp: ts }, ts)),
+      JSON.parse(record(hugeId, 1, 'event_msg', { type: 'task_started' }, ts)),
+      JSON.parse(record(hugeId, 2, 'response_item', {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'x'.repeat(4_000_000) }],
+      }, ts)),
+      JSON.parse(record(hugeId, 3, 'response_item', {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }],
+      }, ts)),
+      JSON.parse(record(hugeId, 4, 'event_msg', { type: 'task_complete' }, ts)),
+    ] }], hugeId, { maxTextChars: 0 })
+    const hugeDir = sessionDirFor(huge, auditRoot)
+    mkdirSync(hugeDir, { recursive: true })
+    writeFileSync(join(hugeDir, 'session.v3.jsonl.zstd'), serializeSession(huge))
+
+    const report = auditSessionsRoot(auditRoot)
+    assert.equal(report.sessions.length, 2)
+    assert.equal(report.oversized.length, 1)
+    assert.equal(report.oversized[0].id, `session-${hugeId}`)
+    assert.ok(report.oversized[0].estimatedTokens > CONTEXT_ADVISORY_TOKENS)
+    assert.ok(report.sessions.find((entry) => entry.id === `session-${id}`).estimatedTokens < CONTEXT_ADVISORY_TOKENS)
+    // The audit reads logs that the importer owns, and only reads them.
+    const before = statSync(join(hugeDir, 'session.v3.jsonl.zstd')).mtimeMs
+    auditSessionsRoot(auditRoot)
+    assert.equal(statSync(join(hugeDir, 'session.v3.jsonl.zstd')).mtimeMs, before)
+  })
+
+  await check('the audit never follows a symlink out of the sessions root', async () => {
+    const linkRoot = join(root, 'scratch-audit-links')
+    mkdirSync(linkRoot, { recursive: true })
+    const outside = join(root, 'outside-audit.jsonl.zstd')
+    writeFileSync(outside, zstdCompressSync(Buffer.from('{"type":"session"}\n')))
+    symlinkSync(outside, join(linkRoot, 'session.v3.jsonl.zstd'))
+    const report = auditSessionsRoot(linkRoot)
+    assert.equal(report.sessions.length, 0)
+  })
+
+  await check('the token estimate prices the surface the harness would price', async () => {
+    const id = '01999999-aaaa-7bbb-8ccc-000000000034'
+    const ts = now.toISOString()
+    const parsed = (ordinal, type, payload) => JSON.parse(record(id, ordinal, type, payload, ts))
+    const built = buildRecords([{ records: [
+      parsed(0, 'session_meta', { id, cwd: '/tmp/token-project', timestamp: ts }),
+      parsed(1, 'event_msg', { type: 'task_started' }),
+      parsed(2, 'response_item', {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'a'.repeat(400) }],
+      }),
+      parsed(3, 'response_item', { type: 'function_call', call_id: 't-1', name: 'shell', arguments: '{"cmd":"ls"}' }),
+      parsed(4, 'response_item', {
+        type: 'function_call_output', call_id: 't-1', output: 'b'.repeat(800),
+      }),
+      parsed(5, 'response_item', {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }],
+      }),
+      parsed(6, 'event_msg', { type: 'task_complete' }),
+    ] }], id)
+    // Mirrors @deepseek-ai/dsh-token-meter: 4 chars/token, +4 per block, +4 per
+    // message. The system prompt and tool schemas are envelope, not history.
+    const expected = [
+      Math.ceil(400 / 4) + 4 + 4, // user text block + block + message framing
+      Math.ceil('shell'.length / 4) + Math.ceil('{"cmd":"ls"}'.length / 4) + 4 + 4, // tool call block
+      Math.ceil(800 / 4) + 4 + 4 + 4, // tool-result text + block + wrapper + message
+      Math.ceil('done'.length / 4) + 4 + 4, // assistant text block
+    ].reduce((a, b) => a + b, 0)
+    assert.equal(built.estimatedTokens, expected)
+    assert.equal(built.surfaceNodes, 4)
   })
 
   await check('listing counts prompts recovered from compaction history', async () => {

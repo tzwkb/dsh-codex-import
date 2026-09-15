@@ -17,8 +17,9 @@
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { runImport, listConversations, formatLocalMinute } from '../lib/convert.js'
+import { runImport, listConversations, formatLocalMinute, DEFAULT_MAX_TEXT_CHARS } from '../lib/convert.js'
 import { verifyPaths } from '../lib/verify.js'
+import { auditSessionsRoot, CONTEXT_ADVISORY_TOKENS } from '../lib/session-audit.js'
 import { assertSafeRoot, syncSessions, writeManifest, manifestPath, readState, rollbackManifest } from '../lib/sync.js'
 import { openAttachmentStore, resolveDshHome } from '../lib/store.js'
 
@@ -28,7 +29,7 @@ function scratchRoot() {
   return typeof configured === 'string' && configured.length > 0 ? configured : tmpdir()
 }
 
-const COMMANDS = new Set(['list', 'convert', 'sync', 'rollback', 'verify'])
+const COMMANDS = new Set(['list', 'convert', 'sync', 'rollback', 'verify', 'audit'])
 const USAGE = `Usage: import-codex <command> [options]
 
 Commands:
@@ -37,6 +38,7 @@ Commands:
   sync       verify and reconcile converted logs into a sessions root
   rollback   undo the most recent sync described by a manifest
   verify     validate one or more session directories
+  audit      measure installed sessions and flag histories too large to compact
 
 Selection and paths:
   --session ID          import one Codex session (repeatable)
@@ -52,9 +54,17 @@ Selection and paths:
 
 Conversion options:
   --max-tool-output N   truncate tool output to N characters (default 0 = keep all)
+  --max-text-chars N     keep at most N chars of any one text (default 262144; 0 = keep all)
+  --full-history         replay every Codex turn instead of its current compaction window
   --no-images           skip attachment-store image admission
   --dry-run             convert and verify, without changing a live root
   --force               refresh a session that is not importer-owned (destructive)
+
+By default a conversation is imported as Codex last held it: the newest
+compaction checkpoint plus every turn after it. A rollout replays every turn
+ever taken, so a long conversation imports many times larger than the context a
+model can still accept — and a history that large cannot be compacted later,
+because compaction has to replay the span that does not fit.
 
 Examples:
   import-codex list --since-hours 168
@@ -70,6 +80,9 @@ class UsageError extends Error {
   }
 }
 
+/** Render a token count compactly for a terminal table. */
+const formatTokens = (tokens) => (tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : String(tokens))
+
 function requiredValue(argv, index, option) {
   const value = argv[index + 1]
   if (value === undefined || value.startsWith('--')) {
@@ -81,7 +94,8 @@ function requiredValue(argv, index, option) {
 function parse(argv) {
   const opts = {
     out: undefined, into: undefined, sinceHours: 24, sessionIds: [],
-    maxToolOutput: 0, limit: undefined, project: undefined, includeArchived: false,
+    maxToolOutput: 0, maxTextChars: DEFAULT_MAX_TEXT_CHARS, fullHistory: false,
+    limit: undefined, project: undefined, includeArchived: false,
     dryRun: false, force: false, images: true, paths: [],
     codexRoot: undefined, dshHome: undefined, manifest: undefined,
   }
@@ -99,6 +113,8 @@ function parse(argv) {
     if (a === '--archived') { opts.includeArchived = true; continue }
     if (a === '--session') { opts.sessionIds.push(requiredValue(argv, i++, a)); continue }
     if (a === '--max-tool-output') { opts.maxToolOutput = Number(requiredValue(argv, i++, a)); continue }
+    if (a === '--max-text-chars') { opts.maxTextChars = Number(requiredValue(argv, i++, a)); continue }
+    if (a === '--full-history') { opts.fullHistory = true; continue }
     else if (a === '--dry-run') opts.dryRun = true
     else if (a === '--force') opts.force = true
     else if (a === '--no-images') opts.images = false
@@ -110,6 +126,9 @@ function parse(argv) {
   }
   if (!Number.isSafeInteger(opts.maxToolOutput) || opts.maxToolOutput < 0) {
     throw new UsageError('--max-tool-output must be zero or a positive integer')
+  }
+  if (!Number.isSafeInteger(opts.maxTextChars) || opts.maxTextChars < 0) {
+    throw new UsageError('--max-text-chars must be zero or a positive integer')
   }
   if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit < 1)) {
     throw new UsageError('--limit must be a positive integer')
@@ -149,19 +168,26 @@ function totalsOf(results) {
     images: a.images + r.stats.imagesSkipped + r.stats.imagesImported,
     imported: a.imported + r.stats.imagesImported,
     history: a.history + r.stats.historyMessages,
-  }), { records: 0, reasoning: 0, tools: 0, errors: 0, repaired: 0, injected: 0, truncated: 0, images: 0, imported: 0, history: 0 })
+    clamped: a.clamped + (r.stats.textClamped ?? 0),
+    windowed: a.windowed + (r.stats.historyWindow === true ? 1 : 0),
+  }), {
+    records: 0, reasoning: 0, tools: 0, errors: 0, repaired: 0, injected: 0,
+    truncated: 0, images: 0, imported: 0, history: 0, clamped: 0, windowed: 0,
+  })
 }
 
 function printConversion(results, rollouts, imageRefusals, store) {
   const totals = totalsOf(results)
   console.log(`rollout files scanned: ${rollouts}`)
   console.log(`conversations:         ${results.length}\n`)
-  console.log('conversation          seg  turns  records  reason  tools  synth  repair   cwd')
+  console.log('conversation          seg  turns  records  reason  tools  synth  repair   context   cwd')
   for (const r of results) {
+    const context = r.estimatedTokens === undefined ? '-' : formatTokens(r.estimatedTokens)
     console.log(
       `${r.id.slice(8, 28).padEnd(20)} ${String(r.segments).padStart(3)} ${String(r.turns).padStart(6)} `
       + `${String(r.records).padStart(8)} ${String(r.stats.reasoning).padStart(7)} ${String(r.stats.toolCalls).padStart(6)} `
-      + `${String(r.stats.synthesized).padStart(6)} ${String(r.stats.repairedTools ?? 0).padStart(7)}   ${r.cwd}`,
+      + `${String(r.stats.synthesized).padStart(6)} ${String(r.stats.repairedTools ?? 0).padStart(7)} `
+      + `${context.padStart(9)}   ${r.cwd}`,
     )
   }
   console.log(
@@ -171,6 +197,13 @@ function printConversion(results, rollouts, imageRefusals, store) {
   )
   if (totals.history > 0) console.log(
     `${totals.history} message(s) recovered from compaction history (present nowhere else in the Codex log)`,
+  )
+  if (totals.windowed > 0) console.log(
+    `${totals.windowed} conversation(s) imported as Codex's current compaction window; `
+    + '--full-history replays every turn instead',
+  )
+  if (totals.clamped > 0) console.log(
+    `${totals.clamped} text block(s) trimmed to the per-text budget, each with an explicit marker`,
   )
   if (totals.imported > 0) console.log(`${totals.imported} image(s) attached via ${store.root}`)
   for (const refusal of imageRefusals ?? []) {
@@ -211,7 +244,7 @@ async function main() {
     if (command === 'verify' && opts.paths.length === 0) {
       throw new UsageError('verify requires at least one session directory or root')
     }
-    if (command !== 'verify' && opts.paths.length > 0) {
+    if (command !== 'verify' && command !== 'audit' && opts.paths.length > 0) {
       throw new UsageError(`unexpected positional argument: ${opts.paths[0]}`)
     }
     if (command === 'convert' && !opts.dryRun && opts.out === undefined) {
@@ -220,6 +253,36 @@ async function main() {
   } catch (error) {
     console.error(`${String(error?.message ?? error)}\n\n${USAGE}`)
     return error?.exitCode ?? 2
+  }
+
+  if (command === 'audit') {
+    const target = opts.paths[0] ?? targetSessionsRoot(opts)
+    const report = auditSessionsRoot(target)
+    console.log(`sessions root: ${report.root}`)
+    console.log(`sessions:      ${report.sessions.length} (${formatTokens(report.totalTokens)} tokens of model context in total)\n`)
+    if (report.oversized.length === 0) {
+      console.log(`no session exceeds the ~${formatTokens(CONTEXT_ADVISORY_TOKENS)} token advisory; all are compactable.`)
+      return 0
+    }
+    console.log(`session id                              context   records   cwd`)
+    for (const session of report.oversized) {
+      console.log(
+        `${String(session.id).padEnd(38)} ${formatTokens(session.estimatedTokens).padStart(7)} `
+        + `${String(session.events).padStart(8)}   ${session.cwd ?? '-'}`,
+      )
+    }
+    console.log(
+      `\n${report.oversized.length} session(s) hold more history than a summary can replay.`,
+      '\nCompaction condenses a span by sending that span to the summarizer, so a history at or beyond',
+      '\nthe model window can neither be sent nor condensed — the session looks fine and then refuses',
+      '\nevery new turn.',
+      '\n\nRebuild one from its Codex conversation, importing Codex\'s current window instead of the',
+      '\nwhole rollout replay:',
+      '\n  import-codex sync --session <codex session id> --force',
+      '\n--force is required because the installed session is no longer exactly what the importer wrote.',
+      '\nIt replaces only that session log; the Codex rollout is never modified.',
+    )
+    return 0
   }
 
   if (command === 'list') {
@@ -277,6 +340,8 @@ async function main() {
         sinceHours: opts.sinceHours,
         sessionIds: opts.sessionIds,
         maxToolOutput: opts.maxToolOutput,
+        maxTextChars: opts.maxTextChars,
+        fullHistory: opts.fullHistory,
         limit: opts.limit,
         project: opts.project,
         includeArchived: opts.includeArchived,
