@@ -52,10 +52,12 @@ Selection and paths:
   --dsh-home DIR         DSH home used for sessions and attachments
   --manifest FILE        rollback manifest (default: metadata beside --into)
 
+  audit also takes one positional path: the sessions root to measure.
+
 Conversion options:
   --max-tool-output N   truncate tool output to N characters (default 0 = keep all)
-  --max-text-chars N     keep at most N chars of any one text (default 262144; 0 = keep all)
-  --full-history         replay every Codex turn instead of its current compaction window
+  --max-text-chars N    keep at most N chars of any one text (default 262144; 0 = keep all)
+  --full-history        replay every Codex turn instead of its current compaction window
   --no-images           skip attachment-store image admission
   --dry-run             convert and verify, without changing a live root
   --force               refresh a session that is not importer-owned (destructive)
